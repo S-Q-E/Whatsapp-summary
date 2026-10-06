@@ -59,24 +59,36 @@ cp .env.example .env   # при желании поправь пути и уро
 
 ## Запуск
 
+Локально:
+
 ```bash
+npm install
 npm run dev     # всё одним процессом: БД + WhatsApp + анализ + API (tsx watch)
 npm run dev:ingest  # только ingestion без HTTP, для отладки
+npm run dev:web     # фронтенд отдельно (proxy /api → :3000)
 # или
-npm run build && npm start
+npm run build && npm run build:web && npm start
 ```
 
-Проверка типов:
+В Docker (рекомендуется для постоянной работы):
+
+```bash
+docker compose up -d --build
+docker compose logs -f
+```
+
+Проверка типов и тестов:
 
 ```bash
 npm run typecheck
+npm test
 ```
 
 ## Где появляется QR и как подключить WhatsApp
 
-1. Запусти `npm run dev`, открой в браузере `http://127.0.0.1:3000/api/whatsapp/qr`
-   (фронтенд со сканером — следующий шаг; пока там JSON с PNG data URL,
-   который можно открыть как картинку).
+1. Запусти приложение (`npm run dev` или Docker), открой веб-интерфейс
+   (`http://127.0.0.1:3000` → раздел «WhatsApp») — там большой QR,
+   который обновляется сам.
 2. На телефоне: **WhatsApp → Настройки → Связанные устройства → Привязать устройство**,
    наведи камеру на QR.
 3. После сканирования сокет принудительно переподключится
@@ -93,9 +105,10 @@ npm run typecheck
 |---|---|
 | SQLite БД | `./data/whatsapp.db` (`SQLITE_PATH`), режим WAL |
 | Auth-сессия (Signal-ключи, эквивалент SSH-приватника) | `./data/auth` (`AUTH_DIR`), права `700` |
+| Бэкапы БД | `./data/backups` (`BACKUP_DIR`), ротация последних `BACKUP_KEEP_N` |
 | Логи | stdout через pino (`LOG_LEVEL`, `LOG_PRETTY`) |
 
-Auth-папка и `*.db` уже внесены в `.gitignore`. Никогда не коммить их.
+Auth-папка, `*.db` и `.env` уже внесены в `.gitignore`. Никогда не коммить их.
 
 ## Как проверить, что сообщения сохраняются
 
@@ -182,6 +195,7 @@ src/
     status-store.ts        # connecting|qr_pending|connected|disconnected|logged_out
     messageParser.ts       # normalizeMessageContent, voice/edit/revoke, durationSec
     store.ts               # upsert contacts/chats, INSERT messages, applyEdit/applyRevoke, jid_aliases, mergeChats
+    voice.ts               # processVoiceMessage: скачивание → ASR → transcript → удаление файла
   server/                  # Fastify: auth, QR-PNG, routes (фронтенд — следующий шаг)
     auth.ts                # сессии в памяти, constant-time пароль, rate limit
     qr.ts                  # QR → PNG data URL с кэшем
@@ -195,12 +209,15 @@ web/
     prompts.ts             # PROMPT_VERSION + сборка промпта (JSON-контракт)
     validate.ts            # строгая валидация ответа модели (AIValidationError)
     providerFactory.ts     # createProvider(): auto|openrouter|ollama|heuristic|mock
+    transcriber.ts         # Transcriber + OpenAI-совместимый ASR (шаг 10)
     providers/
       openrouter.ts          # облако (chat/completions, json_object, ключ из .env)
       ollama.ts            # локальный Ollama (/api/chat, format json, t=0)
       heuristic.ts         # rule-based RU-фолбэк (честно помечен, не LLM)
       mock.ts              # canned-ответы для тестов
-    fixtures.ts            # 6 синтетических переписок без ПДн
+    fixtures.ts            # 6 синтетических переписок без ПДн (seed:demo)
+    evalFixtures.ts        # 27 eval-диалогов шага 8 (без ПДн)
+    eval.ts                # caseInput, scoreCase/scoreAll, compareEvals
     taskService.ts         # bundles -> AI -> reconcile (id, антидубль по источнику)
     analyzeScheduler.ts    # планировщик: mutex, лимит чатов, таймауты, метрики
   digest/                  # этап 3: дневной отчёт (только чтение, без отправки)
@@ -218,6 +235,8 @@ web/
     analyze.ts             # npm run analyze — ручной разбор (планировщик делает то же по cron)
     seedDemo.ts            # npm run seed:demo — синтетические переписки в БД
     digest.ts              # npm run digest — дневной отчёт (builder + renderer)
+    eval.ts                # npm run eval — прогон фикстур через модель + метрики
+    evalCompare.ts         # npm run eval:compare — дельты двух прогонов
 tests/
   app.test.ts              # API через inject (auth/rate-limit/logout/QR/system), mutex планировщика
   dashboard.test.ts        # dashboard/tasks/context endpoints, manual-флаг против AI
@@ -226,6 +245,10 @@ tests/
   reconcile-bugs.test.ts   # регрессия багов шага 2: повтор через неделю, похожие названия
   heuristicFixtures.test.ts# поведение на фикстурах: обещания->задачи, спасибо/вопросы->0
   digest.test.ts           # секции/статистика/порядок/нумерация/отсутствие текста переписок
+  digest-send.test.ts      # sendGuard/grep-отправок, WA-формат, идемпотентность/рестарт/офлайн
+  eval.test.ts             # eval-input, скоринг кейсов, агрегаты, сравнение
+  ops.test.ts              # ретеншн/бэкапы/игнор-чаты/отсутствие текстов в логах
+  voice.test.ts            # транскрибация на фейковом ASR, удаление файла, [голосовое] в контексте
   whatsapp-ingest.test.ts  # обёртки/viewOnce/voice/edit/revoke/алиасы/слияние/супервизор
 ```
 
@@ -259,7 +282,7 @@ tests/
    UNIQUE по источнику. `auto`-провайдер не залипает (primary пробуется
    каждый раз); fallback на эвристику выключен по умолчанию
    (`ALLOW_HEURISTIC_FALLBACK=false`), при включении её create → needs_review.
-5. Проверки: `npm test` (74 теста), `npm run typecheck`, `npm run build`.
+5. Проверки: `npm test` (116 тестов), `npm run typecheck`, `npm run build`.
 
 Таблица `tasks`: `chat_id` (FK → chats), `title`, `description`,
 `source_message_id` (FK → messages.id, wamid резолвится при сверке),
@@ -274,8 +297,55 @@ tests/
 («посмотрю», «отправлю», «уточню»); инфинитивы («скинуть») игнорирует
 намеренно, чтобы не плодить ложные задачи.
 
-### OpenRouter (облако, без локальных ресурсов)
+### Eval: измерение качества извлечения (шаг 8)
 
+`src/ai/evalFixtures.ts` — 27 синтетических диалогов (разговорный русский,
+опечатки, ПДн нет): обещания, выполнения, повтор через неделю, два обещания
+в одном сообщении, отмена, шум, группы, неоднозначности. Каждый кейс описывает
+ожидаемые actions (тип + привязка к сообщению/задаче, без матчинга по названиям).
+
+```bash
+npm run eval -- --provider=openrouter --model=google/gemini-2.5-flash
+npm run eval -- --provider=heuristic            # офлайн, без ключа
+npm run eval -- --provider=openrouter --model=X --cases=promise-basic,cancel
+npm run eval:compare -- --base=eval/results/A.json --other=eval/results/B.json
+```
+
+Метрики: precision/recall создания, точность закрытия/отмены, доля ложных
+задач, доля needs_review. Результат — `eval/results/<дата>-<промпт>-<модель>.json`
+(только синтетика — коммитить можно). Кейс `reschedule` помечен как известный
+гэп контракта (перенос срока выразить нечем) — вне метрик, виден отдельно.
+
+### Как добавить свой диалог (обезличивание)
+
+Реальные переписки в репозиторий НЕЛЬЗЯ — ни тексты, ни JID, ни результаты
+прогонов по ним. Чтобы превратить реальный случай в фикстуру:
+
+1. Выпиши структуру: кто говорит (пациент/врач), было ли обещание,
+   было ли выполнение/отмена, был ли срок — без имён, дат и деталей болезни.
+2. Перескажи своими словами с вымышленными именами («Пациент»),
+   сохранив: глагол обещания, наличие срока, тон (уверенно/сомнительно).
+3. Убери: имена, телефоны, названия препаратов/диагнозов/клиник,
+   конкретные даты (замени на «завтра»/«в пятницу»).
+4. Добавь кейс в `EVAL_CASES` с `expect` (creates/completes/cancels +
+   needsReview/dueDated при необходимости) и прогони `npm run eval`.
+
+Шаблон:
+```ts
+{
+  id: 'мой-кейс',
+  kind: 'direct', // или 'group'
+  description: 'что проверяем',
+  openTask: { title: '...' }, // если нужен контекст известной задачи
+  messages: [
+    { from: 'patient', name: 'Пациент', text: '...', hour: 9, minute: 0 },
+    { from: 'doctor', text: '...', hour: 9, minute: 10 },
+  ],
+  expect: { creates: [1], completes: [], cancels: [] },
+},
+```
+
+### OpenRouter (облако, без локальных ресурсов)
 1. Зарегистрируйся на https://openrouter.ai, возьми ключ на
    https://openrouter.ai/keys и пополни баланс на пару долларов
    (анализ переписок — это центы в день на `gpt-4o-mini`).
@@ -344,6 +414,8 @@ API (`/api`, ответы валидируются Zod):
 | POST | `/api/tasks` | ручное создание `{chatId\|chatJid, title}` → `manual=1` |
 | PATCH | `/api/tasks/:id` | `{status, title, description, dueAt}` → `manual=1` |
 | GET | `/api/tasks/:id/context` | ±5 сообщений вокруг источника с флагами `isSource`/`isClosing` |
+| POST | `/api/digest/preview` | текст дайджеста без отправки и без записи |
+| POST | `/api/digest/send-now` | тело `{"confirm": true}` — отправить сейчас (та же идемпотентность) |
 
 Авторизация: сессии в памяти, cookie `wasec` (httpOnly, SameSite=Lax),
 пароль сверяется в constant-time. Без `WEB_PASSWORD` сервер стартует
@@ -364,6 +436,91 @@ API (`/api`, ответы валидируются Zod):
 Ручные правки ставят `manual=1`; AI такие задачи не перезаписывает
 (переходы complete/cancel по taskId работают, поля — нет).
 
+## Шаг 7: вечерний дайджест в WhatsApp (только владельцу)
+
+- `src/whatsapp/sendGuard.ts` — единственная точка исходящих: разрешён
+  только `OWNER_JID`, всё остальное бросает `NotOwnerError`. Тест grep'ает
+  `src/whatsapp`: `.sendMessage(` встречается только там.
+- Планировщик (`DigestScheduler`, тик каждую минуту + сразу при старте):
+  в `DIGEST_TIME` (default `18:00`) по `TIMEZONE` строит дайджест и шлёт
+  через sendGuard. Таблица `digests` (одна строка на дату): `sent=1`
+  только после успешной отправки — повтор, рестарт и офлайн не дублируют,
+  при недоступном WhatsApp тик повторяет позже.
+- Формат WA-дайджеста (`renderWhatsAppDigest`): «📋 Итоги дня»,
+  🔴 Нужно сделать / 🟡 Обещано / ✅ Выполнено сегодня,
+  `❓ Проверьте: ...` одной строкой, «Всего/Выполнено/Осталось».
+  Сроки относительные (сегодня/завтра/пн, 12 октября), без блока
+  уверенности; JID без имени → «Неизвестный контакт».
+- UI: блок дайджеста на дашборде — «Показать текст» (preview) и
+  «Отправить сейчас» (с `window.confirm`).
+- Для отправки нужен `OWNER_JID` в `.env` (телефон или JID); без него —
+  пропуск с варном, без падения.
+
+## Куда уходят данные (шаг 9, приватность)
+
+Архитектура local-first, но знай точно:
+
+| Данные | Куда уходят |
+|---|---|
+| Тексты сообщений → LLM | Только выбранному `AI_PROVIDER`: `heuristic` — никуда (локальные правила); `ollama` — на твой `OLLAMA_URL`; `openrouter` — в OpenRouter API (а с ним — выбранной модели). Больше ничего никуда не отправляется |
+| Дайджест | Одним сообщением в WhatsApp только на `OWNER_JID` (проверяется `sendGuard`, есть тест). Пациентам приложение не пишет никогда |
+| Логи | Только метаданные (чат, тип, длина). Полный текст — лишь на `debug` при `LOG_MESSAGE_CONTENT=true` (тест `tests/ops.test.ts` это проверяет) |
+| Медиафайлы | Не скачиваются и не хранятся вообще — кроме голосовых при включённой транскрибации (ниже) |
+| Аудио голосовых → ASR | **Только при `TRANSCRIBE_VOICE=true` (по умолчанию ВЫКЛЮЧЕНО).** Аудиофайл голосового сообщения скачивается из WhatsApp и отправляется стороннему сервису транскрибации (`TRANSCRIBE_URL`, default OpenAI `/audio/transcriptions`, модель `TRANSCRIBE_MODEL`, ключ `TRANSCRIBE_API_KEY`). Текст ответа хранится в `messages.transcript` и попадает в AI-контекст с пометкой `[голосовое]`. Сам аудиофайл удаляется сразу после распознавания (успех и ошибка) и нигде не хранится. Скачиваются только realtime-сообщения типов `voice`/`audio` из чатов, не исключённых в «Чатах». История (backfill) не транскрибируется |
+
+Исключение чата из анализа: раздел «Чаты» в UI (переключатель) или
+`chat_settings` в БД — сообщения продолжают сохраняться, но в AI-контекст
+чат не попадает. Ретеншн (`RETENTION_DAYS`, default 0 = выкл): тексты
+сообщений старше срока зануляются, задачи/ссылки/метаданные остаются.
+
+## Голосовые сообщения (шаг 10)
+
+По умолчанию голосовые НЕ распознаются: в AI-контекст попадает только
+плейсхолдер `[голосовое сообщение, N сек]`, в дайджесте — счётчик
+непрослушанных. Для включения задай в `.env`:
+
+```
+TRANSCRIBE_VOICE=true
+TRANSCRIBE_URL=https://api.openai.com/v1   # или Groq: https://api.groq.com/openai/v1
+TRANSCRIBE_MODEL=whisper-1
+TRANSCRIBE_API_KEY=sk-...
+```
+
+Как это работает: новое голосовое из разрешённого чата скачивается во
+временную папку (`TRANSCRIBE_TMP_DIR`, default `./data/tmp`), отправляется
+в ASR, текст пишется в `messages.transcript`, файл удаляется сразу
+(проверено тестом `tests/voice.test.ts` — директория остаётся пустой).
+Ошибки ASR не роняют ingestion, транскрипт остаётся NULL. В AI-контекст
+транскрипт попадает как `[голосовое: <текст>]`.
+
+## Docker, бэкапы, обновление
+
+- `docker compose up -d --build` — multi-stage образ (фронт + бэкенд),
+  том `./data` (БД, auth, бэкапы), healthcheck по `/api/health`,
+  `TZ` берётся из `TIMEZONE`. Порт наружу не торчит дальше `127.0.0.1`.
+- Бэкапы: раз в сутки SQLite `.backup()` в `data/backups`, ротация
+  последних `BACKUP_KEEP_N` (default 7). Auth-папка не копируется —
+  при потере `./data/auth` просто перепривяжи устройство (ниже).
+- Обновление кода: `git pull`, пересобери (`docker compose up -d --build`
+  или `npm run build`), миграции применятся сами при старте.
+  Откат БД: останови приложение и подсунь файл из `data/backups`
+  как `data/whatsapp.db`.
+- Восстановление сессии WhatsApp: если вышел из «Связанных устройств»
+  или `logged_out` — открой раздел «WhatsApp» и просканируй новый QR.
+  Старая auth-сессия при logout стирается автоматически.
+- Обновление фронтенда: `npm run build:web` (или пересборка образа).
+
+## Известные ограничения
+
+- Транскрибации голосовых нет — в дайджесте только счётчик непрослушанных.
+- Правка сообщения не пересоздаёт задачи, созданные из старого текста.
+- Эвристика (`heuristic`) — грубые правила, не LLM; production-качество
+  даёт `openrouter`/`ollama` (см. `npm run eval`).
+- Перенос срока существующей задачи моделью не поддерживается
+  (известный гэп eval-кейса `reschedule`).
+- Сессии WEB-авторизации живут в памяти — рестарт разлогинивает.
+- Резервные копии не шифруются — том `data/` защищай на уровне хоста.
+
 ## Что дальше (не в этом этапе)
 
-Phase 2: React dashboard + QR-страница. Доставка дайджеста в Telegram, Docker.
+Доставка дайджеста в Telegram.

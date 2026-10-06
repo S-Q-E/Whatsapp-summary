@@ -6,6 +6,10 @@ export default function DashboardPage() {
   const [status, setStatus] = useState<string>('…');
   const [attention, setAttention] = useState<Task[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [preview, setPreview] = useState<string | null>(null);
+  const [previewBusy, setPreviewBusy] = useState(false);
+  const [sendBusy, setSendBusy] = useState(false);
+  const [sendResult, setSendResult] = useState<string | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -67,6 +71,38 @@ export default function DashboardPage() {
           ))}
         </div>
       )}
+      <div className="rounded-xl bg-white p-4 shadow-sm">
+        <h2 className="mb-2 font-medium">📋 Вечерний дайджест</h2>
+        <div className="flex gap-2">
+          <button
+            disabled={previewBusy}
+            onClick={() => {
+              setPreviewBusy(true);
+              api.digestPreview().then((p) => setPreview(p.content)).catch((e) => setError(e instanceof Error ? e.message : 'ошибка')).finally(() => setPreviewBusy(false));
+            }}
+            className="rounded-lg bg-slate-200 px-3 py-1.5 text-sm text-slate-700 disabled:opacity-50"
+          >
+            Показать текст
+          </button>
+          <button
+            disabled={sendBusy}
+            onClick={() => {
+              if (!window.confirm('Отправить сегодняшний дайджест в WhatsApp владельцу?')) return;
+              setSendBusy(true);
+              setSendResult(null);
+              api.digestSendNow()
+                .then((r) => setSendResult(r.sent ? 'Отправлено ✓' : `Не отправлено: ${r.reason}`))
+                .catch((e) => setSendResult(`Ошибка: ${e instanceof Error ? e.message : e}`))
+                .finally(() => setSendBusy(false));
+            }}
+            className="rounded-lg bg-slate-900 px-3 py-1.5 text-sm text-white disabled:opacity-50"
+          >
+            Отправить сейчас
+          </button>
+        </div>
+        {sendResult && <div className="mt-2 text-sm text-slate-600">{sendResult}</div>}
+        {preview && <pre className="mt-2 whitespace-pre-wrap rounded-lg bg-slate-50 p-3 text-sm">{preview}</pre>}
+      </div>
     </div>
   );
 }

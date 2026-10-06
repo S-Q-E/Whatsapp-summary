@@ -40,7 +40,7 @@ describe('шаг 3: контекст, ссылки, инкрементально
         chatJid: CHAT,
         contactName: 'Айгуль',
         messages: [
-          { id: 34, direction: 'outgoing', senderName: null, text: 'Посмотрю вечером', messageType: 'text', durationSec: null, timestamp: Date.UTC(2026, 9, 5, 14, 30), whatsappMessageId: 'w' },
+          { id: 34, direction: 'outgoing', senderName: null, text: 'Посмотрю вечером', messageType: 'text', durationSec: null, transcript: null, timestamp: Date.UTC(2026, 9, 5, 14, 30), whatsappMessageId: 'w' },
         ],
         existingTasks: [{ id: 12, title: 'Посмотреть анализы', status: 'open' }],
         analyzedAt: Date.UTC(2026, 9, 5, 15, 0),

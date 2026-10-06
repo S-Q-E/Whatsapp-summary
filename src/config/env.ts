@@ -82,6 +82,30 @@ const envSchema = z.object({
   ),
   /** Fallback auto-провайдера на эвристику при ошибке primary (созданное → needs_review). */
   ALLOW_HEURISTIC_FALLBACK: optBool(false),
+  /** Время дневного дайджеста HH:MM в TIMEZONE (шаг 7). */
+  DIGEST_TIME: optString('18:00').superRefine((v, ctx) => {
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(v)) {
+      ctx.addIssue({ code: 'custom', message: 'DIGEST_TIME: нужно HH:MM, например 18:00' });
+    }
+  }),
+  /** Бэкапы sqlite: держать последние N (шаг 9). */
+  BACKUP_KEEP_N: z.preprocess(
+    (v) => (v === '' || v === undefined ? undefined : Number(v)),
+    z.number({ error: 'BACKUP_KEEP_N: нужно целое число, например 7' }).int().min(1).max(365).default(7),
+  ),
+  /** Папка бэкапов (внутри тома data). */
+  BACKUP_DIR: optString('./data/backups'),
+  /** Ретеншн текстов сообщений в днях; 0 = выключено (шаг 9). */
+  RETENTION_DAYS: z.preprocess(
+    (v) => (v === '' || v === undefined ? undefined : Number(v)),
+    z.number({ error: 'RETENTION_DAYS: нужно целое число дней, 0 = выключено' }).int().min(0).max(3650).default(0),
+  ),
+  /** Транскрибация голосовых (шаг 10). ВЫКЛЮЧЕНА по умолчанию: аудио уходит стороннему ASR. */
+  TRANSCRIBE_VOICE: optBool(false),
+  TRANSCRIBE_URL: optString('https://api.openai.com/v1'),
+  TRANSCRIBE_MODEL: optString('whisper-1'),
+  TRANSCRIBE_API_KEY: optString(''),
+  TRANSCRIBE_TMP_DIR: optString('./data/tmp'),
   AI_TEMPERATURE: z.preprocess(
     (v) => (v === '' || v === undefined ? undefined : Number(v)),
     z.number({ error: 'AI_TEMPERATURE: нужно число 0..2' }).min(0).max(2).default(0),
@@ -128,6 +152,15 @@ export const env = {
   aiContextLimit: raw.AI_CONTEXT_LIMIT,
   aiContextDays: raw.AI_CONTEXT_DAYS,
   allowHeuristicFallback: raw.ALLOW_HEURISTIC_FALLBACK,
+  digestTime: raw.DIGEST_TIME,
+  backupKeepN: raw.BACKUP_KEEP_N,
+  backupDir: raw.BACKUP_DIR,
+  retentionDays: raw.RETENTION_DAYS,
+  transcribeVoice: raw.TRANSCRIBE_VOICE,
+  transcribeUrl: raw.TRANSCRIBE_URL,
+  transcribeModel: raw.TRANSCRIBE_MODEL,
+  transcribeApiKey: raw.TRANSCRIBE_API_KEY,
+  transcribeTmpDir: raw.TRANSCRIBE_TMP_DIR,
   aiTemperature: raw.AI_TEMPERATURE,
   openrouterApiKey: raw.OPENROUTER_API_KEY,
   openrouterModel: raw.OPENROUTER_MODEL,

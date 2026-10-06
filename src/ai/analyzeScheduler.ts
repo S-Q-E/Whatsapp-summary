@@ -1,6 +1,8 @@
 import { sql } from 'drizzle-orm';
 import type { Logger } from 'pino';
 import type { Db } from '../database/db.js';
+import { runBackup } from '../ops/backup.js';
+import { runRetention } from '../ops/retention.js';
 import { analyzeChat, loadPendingBundles } from './taskService.js';
 import type { AIProvider } from './types.js';
 
@@ -30,6 +32,13 @@ export type SchedulerOptions = {
   /** таймаут одного чата, мс (опоздавший анализ всё равно коммитит — идемпотентно) */
   chatTimeoutMs: number;
   now?: () => number;
+  /** обслуживание БД (шаг 9); опущено = только анализ */
+  maintenance?: {
+    sqliteFile: string;
+    backupDir: string;
+    backupKeepN: number;
+    retentionDays: number;
+  };
 };
 
 export type TickResult = {
@@ -50,6 +59,7 @@ export type TickResult = {
 export class AnalyzeScheduler {
   private timer: ReturnType<typeof setInterval> | null = null;
   private running = false;
+  private lastMaintenance = 0;
   private readonly metrics: AnalyzeMetrics = {
     lastRunAt: null,
     lastDurationMs: 0,
@@ -93,6 +103,7 @@ export class AnalyzeScheduler {
     const t0 = now();
     const res: TickResult = { started: true, chats: 0, created: 0, updated: 0, skipped: 0 };
     try {
+      await this.maybeMaintain(now());
       const bundles = loadPendingBundles(db, {}).slice(0, this.opts.maxChats);
       const provider = this.opts.getProvider();
       const analyzedAt = now();
@@ -128,6 +139,24 @@ export class AnalyzeScheduler {
       this.running = false;
     }
     return res;
+  }
+
+  private async maybeMaintain(nowMs: number): Promise<void> {
+    const m = this.opts.maintenance;
+    if (!m) return;
+    if (nowMs - this.lastMaintenance < 86_400_000) return;
+    this.lastMaintenance = nowMs;
+    const { db, log } = this.opts;
+    try {
+      runRetention(db, log, { days: m.retentionDays, now: nowMs });
+    } catch (err) {
+      log.warn({ err }, 'maintenance: retention failed');
+    }
+    try {
+      await runBackup(m.sqliteFile, m.backupDir, m.backupKeepN, log);
+    } catch (err) {
+      log.warn({ err }, 'maintenance: backup failed');
+    }
   }
 
   private withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {

@@ -93,6 +93,7 @@ export function buildDigest(db: Db, day: Date): DailyDigest {
     title: t.title,
     status: t.status as DigestTaskItem['status'],
     deadlineLabel: deadlineLabel(t, start, end),
+    dueAt: t.dueAt ?? null,
     confidence: t.confidence,
   });
 

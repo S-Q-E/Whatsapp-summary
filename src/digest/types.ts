@@ -11,6 +11,8 @@ export type DigestTaskItem = {
   status: TaskStatus;
   /** человекочитаемый срок: deadline_text, «сегодня» или дата; null = не указан */
   deadlineLabel: string | null;
+  /** срок в ms epoch для относительных подписей WA-дайджеста; null = нет */
+  dueAt: number | null;
   confidence: number | null;
 };
 

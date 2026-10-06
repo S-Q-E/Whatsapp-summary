@@ -1,0 +1,18 @@
+# WhatsApp AI Secretary — локальный запуск (шаг 9).
+# Все секреты только в .env (в образ НЕ копируется).
+# БД, auth-сессия и бэкапы живут в ./data на хосте.
+services:
+  app:
+    build: .
+    image: wa-secretary:latest
+    env_file:
+      - .env
+    environment:
+      # libc-часовой пояс контейнера = TIMEZONE из .env (подстановка compose);
+      # default совпадает с дефолтом приложения.
+      TZ: ${TIMEZONE:-Asia/Almaty}
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "127.0.0.1:3000:3000"
+    restart: unless-stopped

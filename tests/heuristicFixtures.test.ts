@@ -17,6 +17,7 @@ function toInput(fixtureId: string): ConversationInput {
       senderName: m.senderName,
       text: m.text,
       messageType: m.messageType,
+      transcript: null,
       durationSec: null,
       timestamp: 1_700_000_000_000 + m.minuteOffset * 60_000,
       whatsappMessageId: `t-${fixtureId}-${i}`,

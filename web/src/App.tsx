@@ -1,15 +1,17 @@
 import { useEffect, useState } from 'react';
 import DashboardPage from './pages/Dashboard';
+import Chats from './pages/Chats';
 import Login from './pages/Login';
 import Tasks from './pages/Tasks';
 import WhatsApp from './pages/WhatsApp';
 
-type Route = 'dashboard' | 'whatsapp' | 'tasks' | 'login';
+type Route = 'dashboard' | 'whatsapp' | 'tasks' | 'chats' | 'login';
 
 function route(): Route {
   const h = window.location.hash;
   if (h.startsWith('#/whatsapp')) return 'whatsapp';
   if (h.startsWith('#/tasks')) return 'tasks';
+  if (h.startsWith('#/chats')) return 'chats';
   if (h.startsWith('#/login')) return 'login';
   return 'dashboard';
 }
@@ -28,6 +30,7 @@ function Nav({ current }: { current: Route }) {
     <nav className="sticky top-0 flex gap-1 border-b border-slate-200 bg-slate-50/95 p-2 backdrop-blur">
       {link('dashboard', '🏠 Главная', current === 'dashboard')}
       {link('tasks', '📝 Задачи', current === 'tasks')}
+      {link('chats', '💬 Чаты', current === 'chats')}
       {link('whatsapp', '📱 WhatsApp', current === 'whatsapp')}
     </nav>
   );
@@ -51,6 +54,7 @@ export default function App() {
       <Nav current={current} />
       {current === 'dashboard' && <DashboardPage />}
       {current === 'tasks' && <Tasks />}
+      {current === 'chats' && <Chats />}
       {current === 'whatsapp' && <WhatsApp />}
     </div>
   );

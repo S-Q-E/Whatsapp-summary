@@ -7,8 +7,8 @@ const INPUT: ConversationInput = {
   chatJid: 'demo@s.whatsapp.net',
   contactName: 'Пациент',
   messages: [
-    { id: 34, direction: 'outgoing', senderName: null, text: 'Посмотрю вечером', messageType: 'text', durationSec: null, timestamp: 1, whatsappMessageId: 'w1' },
-    { id: 35, direction: 'outgoing', senderName: null, text: 'Посмотрела, всё в норме', messageType: 'text', durationSec: null, timestamp: 2, whatsappMessageId: 'w2' },
+    { id: 34, direction: 'outgoing', senderName: null, text: 'Посмотрю вечером', messageType: 'text', durationSec: null, transcript: null, timestamp: 1, whatsappMessageId: 'w1' },
+    { id: 35, direction: 'outgoing', senderName: null, text: 'Посмотрела, всё в норме', messageType: 'text', durationSec: null, transcript: null, timestamp: 2, whatsappMessageId: 'w2' },
   ],
   existingTasks: [{ id: 12, title: 'Посмотреть анализы', status: 'open' }],
   analyzedAt: 3,

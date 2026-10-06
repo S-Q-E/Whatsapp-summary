@@ -44,6 +44,8 @@ export const messages = sqliteTable(
     deletedAt: integer('deleted_at'),
     /** длительность медиа в секундах (голосовые/аудио/видео), шаг 4 */
     durationSec: integer('duration_sec'),
+    /** транскрипт голосового (шаг 10); NULL = нет или ещё не распознан */
+    transcript: text('transcript'),
   },
   (t) => [
     uniqueIndex('messages_wamid_chat_uidx').on(t.whatsappMessageId, t.chatJid),
@@ -158,3 +160,33 @@ export const settings = sqliteTable('settings', {
 });
 
 export type SettingsRow = typeof settings.$inferSelect;
+
+/**
+ * chat_settings — настройки по чатам (шаг 9).
+ * ignored=1: чат исключён из AI-анализа (тексты не уходят провайдеру),
+ * переключается в UI. Сообщения продолжают сохраняться.
+ */
+export const chatSettings = sqliteTable('chat_settings', {
+  chatJid: text('chat_jid').primaryKey(),
+  ignored: integer('ignored').notNull().default(0),
+  updatedAt: integer('updated_at').notNull(),
+});
+
+export type ChatSettingsRow = typeof chatSettings.$inferSelect;
+
+/**
+ * digests — отправленные (и несеные) дневные дайджесты (шаг 7).
+ * Одна строка на дату (YYYY-MM-DD в TIMEZONE): повторная отправка
+ * за тот же день невозможна. sent=1 ставится ТОЛЬКО после успешной
+ * отправки; рестарт/офлайн оставляют sent=0 — следующий тик повторит.
+ */
+export const digests = sqliteTable('digests', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  date: text('date').notNull().unique(),
+  content: text('content').notNull(),
+  sent: integer('sent').notNull().default(0),
+  sentAt: integer('sent_at'),
+  createdAt: integer('created_at').notNull(),
+});
+
+export type DigestRow = typeof digests.$inferSelect;

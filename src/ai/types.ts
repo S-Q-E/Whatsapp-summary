@@ -10,6 +10,8 @@ export type ConversationMessage = {
   senderName: string | null;
   /** null для медиа без подписи — AI видит только [image]/[audio]/... */
   text: string | null;
+  /** транскрипт голосового (шаг 10); в контекст попадает с пометкой [голосовое] */
+  transcript: string | null;
   messageType: string;
   /** секунды для voice/audio/video, иначе null */
   durationSec: number | null;

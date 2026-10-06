@@ -5,6 +5,7 @@ import { env } from '../config/env.js';
 import type { Db } from '../database/db.js';
 import { startWhatsAppClient, type WhatsappClient } from './connection.js';
 import { QrStore } from './qr-manager.js';
+import { sendDigest } from './sendGuard.js';
 import { StatusStore, type StatusSnapshot } from './status-store.js';
 
 export type ManagerEvent = 'qr' | 'status';
@@ -165,6 +166,20 @@ export class WhatsAppManager {
       // ignore errors during shutdown
     }
     this.client = null;
+  }
+
+  /** Подключён ли сокет прямо сейчас (для дайджест-отправки). */
+  isConnected(): boolean {
+    return this.client !== null && this.statusStore.snapshot(false).status === 'connected';
+  }
+
+  /**
+   * Отправка дайджеста владельцу (шаг 7): единственный путь исходящих
+   * в WhatsApp, строго через sendGuard (только OWNER_JID).
+   */
+  async sendDigestText(text: string): Promise<void> {
+    if (!this.client) throw new Error('WhatsApp не подключён — дайджест не отправлен');
+    await sendDigest(this.client.sock, env.ownerJid, env.ownerJid, text);
   }
 
   private emitStatus(force?: 'connecting'): void {

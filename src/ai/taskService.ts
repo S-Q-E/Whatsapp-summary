@@ -38,6 +38,7 @@ type MessageRowLite = {
   direction: string;
   message_type: string;
   text: string | null;
+  transcript: string | null;
   duration_sec: number | null;
   timestamp: number;
   whatsapp_message_id: string;
@@ -80,6 +81,7 @@ export function loadPendingBundles(db: Db, opts: PendingOptions = {}): ChatBundl
       AND timestamp >= ${dayStart} AND timestamp < ${dayEnd}
       AND deleted_at IS NULL
       AND message_type NOT IN ('reaction', 'protocol')
+      AND chat_jid NOT IN (SELECT chat_jid FROM chat_settings WHERE ignored = 1)
   `);
 
   const contacts = new Map<string, { id: number; name: string | null }>();
@@ -99,7 +101,7 @@ export function loadPendingBundles(db: Db, opts: PendingOptions = {}): ChatBundl
     const chatId = chatIds.get(chatJid);
     if (chatId === undefined) continue;
     const rows = db.all<MessageRowLite>(sql`
-      SELECT id, chat_jid, sender_name, direction, message_type, text, duration_sec, timestamp,
+      SELECT id, chat_jid, sender_name, direction, message_type, text, transcript, duration_sec, timestamp,
              whatsapp_message_id, is_from_me, processed_at
       FROM messages
       WHERE chat_jid = ${chatJid} AND timestamp >= ${cutoff}
@@ -109,7 +111,8 @@ export function loadPendingBundles(db: Db, opts: PendingOptions = {}): ChatBundl
       ORDER BY timestamp DESC LIMIT ${limit}
     `);
     rows.reverse(); // старые -> новые
-    if (!rows.some((m) => m.text && m.text.trim() !== '')) continue;
+    // Чат без какого-либо текстового содержимого (включая транскрипты) — анализировать нечего
+    if (!rows.some((m) => (m.text && m.text.trim() !== '') || (m.transcript && m.transcript.trim() !== ''))) continue;
     const c = contacts.get(chatJid);
     bundles.push({
       chatJid,
@@ -121,6 +124,7 @@ export function loadPendingBundles(db: Db, opts: PendingOptions = {}): ChatBundl
         direction: (m.is_from_me ? 'outgoing' : 'incoming') as 'incoming' | 'outgoing',
         senderName: m.sender_name,
         text: m.text,
+        transcript: m.transcript,
         messageType: m.message_type,
         durationSec: m.duration_sec,
         timestamp: m.timestamp,

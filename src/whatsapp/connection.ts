@@ -4,6 +4,7 @@ import { Boom } from '@hapi/boom';
 import makeWASocket, {
   Browsers,
   DisconnectReason,
+  downloadMediaMessage,
   fetchLatestBaileysVersion,
   isJidBroadcast,
   isJidNewsletter,
@@ -21,6 +22,8 @@ import { baileysLogger } from '../config/logger.js';
 import type { Db } from '../database/db.js';
 import { normalizeJid } from '../utils/jid.js';
 import { parseWAMessage, extractEditText, toMs, type ProtocolEvent } from './messageParser.js';
+import { createTranscriber } from '../ai/transcriber.js';
+import { processVoiceMessage } from './voice.js';
 import {
   applyEdit,
   applyRevoke,
@@ -131,6 +134,10 @@ export async function startWhatsAppClient(opts: {
 
   let stopped = false;
   let sock: WASocket | null = null;
+
+  // Транскрибер создаётся один раз на клиент (шаг 10); сама работа —
+  // fire-and-forget в handleIncoming, ingestion не блокируется.
+  const transcriber = createTranscriber();
 
   const supervisor = new ReconnectSupervisor(async () => {
     try {
@@ -265,6 +272,29 @@ export async function startWhatsAppClient(opts: {
           upsertContact(db, log, { jid: parsed.senderJid, pushName: parsed.pushName });
         }
         storeMessage(db, log, parsed);
+        // Шаг 10: голосовые из realtime — в фоновую транскрибацию.
+        // История (backfill) не трогаем: дорого и шумно; игнор-чаты отсекает сам pipeline.
+        if (
+          source === 'realtime' &&
+          env.transcribeVoice &&
+          (parsed.messageType === 'voice' || parsed.messageType === 'audio')
+        ) {
+          const waMsg = m;
+          void processVoiceMessage(
+            {
+              db,
+              log,
+              transcriber,
+              downloadAudio: (w) => downloadMediaMessage(w, 'buffer', {}),
+              tmpDir: env.transcribeTmpDir,
+              enabled: true,
+            },
+            waMsg,
+            { chatJid: parsed.chatJid, whatsappMessageId: parsed.whatsappMessageId, messageType: parsed.messageType },
+          ).catch(() => {
+            // processVoiceMessage не бросает, страховка на всякий случай
+          });
+        }
       }
       if (messages.length > 0) {
         log.debug({ count: messages.length, source }, 'batch stored');

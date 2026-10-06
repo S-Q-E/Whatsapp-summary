@@ -44,6 +44,10 @@ function formatMessage(
 /** Текст или честный плейсхолдер типа (шаг 4.5: голосовые — с длительностью). */
 function messageBody(m: ConversationInput['messages'][number]): string {
   if (m.text && m.text.length > 0) return m.text;
+  // Шаг 10: распознанное голосовое идёт в контекст как обычный текст с пометкой
+  if (m.messageType === 'voice' && m.transcript && m.transcript.length > 0) {
+    return `[голосовое: ${m.transcript}]`;
+  }
   if (m.messageType === 'voice') {
     return m.durationSec !== null && m.durationSec !== undefined
       ? `[голосовое сообщение, ${m.durationSec} сек]`

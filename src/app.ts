@@ -13,6 +13,9 @@ import { Auth, authGuard } from './server/auth.js';
 import { QrPng } from './server/qr.js';
 import { whatsappRoutes, type WhatsAppController } from './server/routes/whatsapp.js';
 import { dashboardRoutes } from './server/routes/tasks.js';
+import { chatsRoutes } from './server/routes/chats.js';
+import { digestRoutes } from './server/routes/digest.js';
+import { DigestScheduler, DigestService } from './digest/service.js';
 import { WhatsAppManager } from './whatsapp/manager.js';
 import type { Logger } from 'pino';
 
@@ -33,6 +36,8 @@ export type AppOptions = {
   qrPng: (qr: string | null) => Promise<string | null>;
   /** опущен = авторизация выключена (тесты, локальный 127.0.0.1) */
   auth?: { password: string; loginMaxAttempts?: number; loginWindowMs?: number };
+  /** опущен = routes дайджеста не регистрируются (старые тесты) */
+  digest?: DigestService;
 };
 
 /**
@@ -71,6 +76,10 @@ export async function createApp(opts: AppOptions): Promise<FastifyInstance> {
 
   await whatsappRoutes(app, opts.wa, opts.qrPng);
   await dashboardRoutes(app, opts.db);
+  await chatsRoutes(app, opts.db);
+  if (opts.digest) {
+    await digestRoutes(app, opts.digest);
+  }
 
   // Фронтенд (шаг 6): собранный web/dist раздаётся как статика + SPA-fallback.
   // Без собранного фронта API работает как раньше.
@@ -118,8 +127,20 @@ export async function runApp(): Promise<{ app: FastifyInstance; stop: () => Prom
     intervalMs: env.analyzeIntervalMin * 60_000,
     maxChats: env.analyzeMaxChats,
     chatTimeoutMs: env.aiTimeoutMs,
+    maintenance: {
+      sqliteFile: path.resolve(env.sqlitePath),
+      backupDir: path.resolve(env.backupDir),
+      backupKeepN: env.backupKeepN,
+      retentionDays: env.retentionDays,
+    },
   });
   const qrPng = new QrPng();
+  const digestService = new DigestService(db, logger, wa, {
+    ownerJid: env.ownerJid,
+    timezone: env.timezone,
+    digestTime: env.digestTime,
+  });
+  const digestScheduler = new DigestScheduler(digestService, logger);
 
   const app = await createApp({
     db,
@@ -128,17 +149,20 @@ export async function runApp(): Promise<{ app: FastifyInstance; stop: () => Prom
     scheduler,
     qrPng: (qr) => qrPng.toDataUrl(qr),
     auth: { password: env.webPassword },
+    digest: digestService,
   });
 
-  // WhatsApp и планировщик стартуют в фоне: API отвечает даже без сети/WA.
+  // WhatsApp и планировщики стартуют в фоне: API отвечает даже без сети/WA.
   wa.start().catch((err: unknown) => {
     logger.error({ err }, 'whatsapp autostart failed (UI still serves, use connect API)');
   });
   scheduler.start();
+  digestScheduler.start();
 
   const stop = async (): Promise<void> => {
-    logger.info('shutting down (cron stopped, session kept)');
+    logger.info('shutting down (crons stopped, session kept)');
     scheduler.stop();
+    digestScheduler.stop();
     wa.stop();
     try {
       await app.close();

@@ -83,6 +83,19 @@ export const api = {
     req<Task>('/api/tasks', { method: 'POST', body: JSON.stringify(body) }),
   taskContext: (id: number) =>
     req<{ task: { id: number; title: string }; messages: ContextMessage[] }>(`/api/tasks/${id}/context`),
+  chats: () =>
+    req<{ id: number; jid: string; displayName: string | null; isGroup: number; ignored: number; messageCount: number }[]>('/api/chats'),
+  setChatIgnored: (id: number, ignored: 0 | 1) =>
+    req<{ id: number; jid: string; ignored: number }>(`/api/chats/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ ignored }),
+    }),
+  digestPreview: () => req<{ dateIso: string; content: string }>('/api/digest/preview', { method: 'POST' }),
+  digestSendNow: () =>
+    req<{ sent: boolean; reason: string; dateIso: string }>('/api/digest/send-now', {
+      method: 'POST',
+      body: JSON.stringify({ confirm: true }),
+    }),
 };
 
 export function formatDue(t: Task): string {

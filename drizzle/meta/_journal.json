@@ -29,6 +29,27 @@
       "when": 1791270598228,
       "tag": "0003_step6_manual_flag",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1791272524051,
+      "tag": "0004_step7_digests",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1791273984171,
+      "tag": "0005_step9_chat_settings",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1791274721222,
+      "tag": "0006_step10_transcript",
+      "breakpoints": true
     }
   ]
 }
