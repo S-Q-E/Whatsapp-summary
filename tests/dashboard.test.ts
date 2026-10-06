@@ -74,7 +74,7 @@ describe('шаг 6: dashboard API', () => {
     try {
       const dayStart = startOfDay(new Date('2026-10-06T12:00:00+05:00'), TZ);
       seedDay(db, dayStart);
-      const app = await createApp({ db, log, wa: waStub, scheduler: schedStub, qrPng });
+      const app = await createApp({ db, log, wa: waStub, scheduler: schedStub, qrPng, auth: { password: '', allowNoAuth: true } });
       const res = await app.inject({ method: 'GET', url: '/api/dashboard' });
       assert.equal(res.statusCode, 200);
       const b = res.json();
@@ -94,7 +94,7 @@ describe('шаг 6: dashboard API', () => {
     try {
       const dayStart = startOfDay(new Date('2026-10-06T12:00:00+05:00'), TZ);
       const { chatId } = seedDay(db, dayStart);
-      const app = await createApp({ db, log, wa: waStub, scheduler: schedStub, qrPng });
+      const app = await createApp({ db, log, wa: waStub, scheduler: schedStub, qrPng, auth: { password: '', allowNoAuth: true } });
       const open = await app.inject({ method: 'GET', url: '/api/tasks?status=open' });
       assert.equal(open.json().length, 3);
       assert.ok(open.json().every((t: { status: string }) => t.status === 'open'));
@@ -114,7 +114,7 @@ describe('шаг 6: dashboard API', () => {
     try {
       const dayStart = startOfDay(new Date('2026-10-06T12:00:00+05:00'), TZ);
       const { chatId } = seedDay(db, dayStart);
-      const app = await createApp({ db, log, wa: waStub, scheduler: schedStub, qrPng });
+      const app = await createApp({ db, log, wa: waStub, scheduler: schedStub, qrPng, auth: { password: '', allowNoAuth: true } });
       const taskId = db.get<{ id: number }>(sql`SELECT id FROM tasks WHERE title = 'Сегодня'`)!.id;
       const patch = await app.inject({
         method: 'PATCH', url: `/api/tasks/${taskId}`,
@@ -153,19 +153,27 @@ describe('шаг 6: dashboard API', () => {
       }
       const srcId = db.get<{ id: number }>(sql`SELECT id FROM messages WHERE whatsapp_message_id = 'w8'`)!.id;
       const closeId = db.get<{ id: number }>(sql`SELECT id FROM messages WHERE whatsapp_message_id = 'w10'`)!.id;
+      // w6 — голосовое с транскриптом, w9 — удалённое (в контекст не попадает)
+      db.run(sql`UPDATE messages SET message_type = 'voice', transcript = 'позвони маме' WHERE whatsapp_message_id = 'w6'`);
+      db.run(sql`UPDATE messages SET deleted_at = ${dayStart} WHERE whatsapp_message_id = 'w9'`);
       db.run(sql`INSERT INTO tasks (chat_id, chat_jid, title, status, source_message_id, closed_by_message_id, created_at, updated_at)
         VALUES (${chatId}, 'a@s.whatsapp.net', 'С контекстом', 'done', ${srcId}, ${closeId}, 1, 1)`);
       const taskId = db.get<{ id: number }>(sql`SELECT last_insert_rowid() AS id`)!.id;
-      const app = await createApp({ db, log, wa: waStub, scheduler: schedStub, qrPng });
+      const app = await createApp({ db, log, wa: waStub, scheduler: schedStub, qrPng, auth: { password: '', allowNoAuth: true } });
       const res = await app.inject({ method: 'GET', url: `/api/tasks/${taskId}/context` });
       assert.equal(res.statusCode, 200);
       const body = res.json();
-      assert.equal(body.messages.length, 11);
+      assert.equal(body.messages.length, 10); // 11 минус удалённое w9
       const src = body.messages.find((m: { isSource: boolean }) => m.isSource);
       const cls = body.messages.find((m: { isClosing: boolean }) => m.isClosing);
       assert.ok(src && cls);
       assert.equal(src.text, 'текст 8');
       assert.equal(cls.text, 'текст 10');
+      // транскрипт виден, удалённое сообщение — нет (окно считается в БД)
+      const voice = body.messages.find((m: { transcript: string | null }) => m.transcript === 'позвони маме');
+      assert.ok(voice, 'транскрипт должен быть в контексте');
+      assert.ok(!body.messages.some((m: { text: string | null }) => m.text === 'текст 9'), 'удалённые не показываем');
+      assert.equal(body.messages.length, 10);
       // в списке задач текстов переписок нет
       const list = await app.inject({ method: 'GET', url: '/api/tasks' });
       assert.ok(!JSON.stringify(list.json()).includes('текст 8'));

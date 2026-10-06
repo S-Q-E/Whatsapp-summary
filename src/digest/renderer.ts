@@ -81,13 +81,19 @@ export function renderWhatsAppDigest(d: DailyDigest, timezone: string): string {
   let n = 0;
   let remaining = 0;
 
-  const item = (t: DigestTaskItem): void => {
+  /** Карточка задачи; у выполненных срока нет — только факт. */
+  const item = (t: DigestTaskItem, showDue: boolean): void => {
     n += 1;
     lines.push(`${n}. ${displayName(t)}`);
     lines.push(t.title);
-    lines.push(`Срок: ${relativeDue(t.dueAt, dayStart, dayEnd, timezone)}`);
+    if (showDue) lines.push(`Срок: ${relativeDue(t.dueAt, dayStart, dayEnd, timezone)}`);
     lines.push('');
   };
+
+  /** Топ-15 секции + хвост «…и ещё N». */
+  const TOP = 15;
+  const cap = (items: DigestTaskItem[]): { head: DigestTaskItem[]; rest: number } =>
+    items.length > TOP ? { head: items.slice(0, TOP), rest: items.length - TOP } : { head: items, rest: 0 };
 
   const open = (items: DigestTaskItem[]): DigestTaskItem[] =>
     items.filter((t) => t.status === 'open');
@@ -104,15 +110,21 @@ export function renderWhatsAppDigest(d: DailyDigest, timezone: string): string {
     // сначала просроченные, потом остальные
     const sorted = [...attention].sort((a, b) => (a.dueAt ?? Infinity) - (b.dueAt ?? Infinity));
     lines.push('🔴 Нужно сделать', '');
-    for (const t of sorted) item(t);
+    const { head, rest } = cap(sorted);
+    for (const t of head) item(t, true);
+    if (rest > 0) lines.push(`…и ещё ${rest}`, '');
   }
   if (promised.length > 0) {
     lines.push('🟡 Обещано', '');
-    for (const t of promised) item(t);
+    const { head, rest } = cap(promised);
+    for (const t of head) item(t, true);
+    if (rest > 0) lines.push(`…и ещё ${rest}`, '');
   }
   if (d.sections.completed.length > 0) {
     lines.push('✅ Выполнено сегодня', '');
-    for (const t of d.sections.completed) item(t);
+    const { head, rest } = cap(d.sections.completed);
+    for (const t of head) item(t, false);
+    if (rest > 0) lines.push(`…и ещё ${rest}`, '');
   }
   if (reviews.length > 0) {
     lines.push(`❓ Проверьте (${reviews.length}): ${reviews.map((t) => t.title).join('; ')}`, '');

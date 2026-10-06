@@ -38,7 +38,8 @@ function formatMessage(
     m.direction === 'outgoing' ? `ВРАЧ${m.senderName ? ` (${m.senderName})` : ''}` : (m.senderName ?? 'Собеседник');
   const time = formatLocal(m.timestamp, timezone);
   const body = messageBody(m);
-  return `[${msgKey(m.id)}] [${time}] ${who}: ${body}`;
+  const hasTask = m.existingTaskId ? ` [уже есть задача #${m.existingTaskId}]` : '';
+  return `[${msgKey(m.id)}] [${time}] ${who}: ${body}${hasTask}`;
 }
 
 /** Текст или честный плейсхолдер типа (шаг 4.5: голосовые — с длительностью). */
@@ -65,6 +66,13 @@ export function buildUserPrompt(input: ConversationInput, timezone: string): str
           .map((t) => `- [${taskKey(t.id)}] "${t.title}" (${t.status})`)
           .join('\n')
       : '(нет известных открытых задач)';
+  const closed = (input.recentlyClosed ?? [])
+    .map((t) => `- [${taskKey(t.id)}] "${t.title}" (${t.status})`)
+    .join('\n');
+  const closedBlock =
+    closed.length > 0
+      ? ['Уже обработанные задачи (закрыты, НЕ создавай заново, ссылайся только для complete/cancel):', closed, '']
+      : [];
   return [
     `Текущее время: ${formatLocal(input.analyzedAt, timezone)}`,
     `Чат: ${input.chatJid}${input.contactName ? ` (${input.contactName})` : ''}`,
@@ -72,6 +80,7 @@ export function buildUserPrompt(input: ConversationInput, timezone: string): str
     'Известные открытые задачи этого чата (ссылайся taskId вида "t12"):',
     known,
     '',
+    ...closedBlock,
     'Переписка (по порядку, у каждого сообщения ключ вида [m34]):',
     ...lines,
     '',

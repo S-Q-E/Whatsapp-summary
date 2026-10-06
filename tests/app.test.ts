@@ -60,7 +60,7 @@ describe('app API (шаг 5)', () => {
   it('GET /health без авторизации', async () => {
     const { db, close } = openTestDb();
     try {
-      const app = await createApp({ db, log, wa: mockWa(), scheduler: mockScheduler(), qrPng });
+      const app = await createApp({ db, log, wa: mockWa(), scheduler: mockScheduler(), qrPng, auth: { password: '', allowNoAuth: true } });
       const res = await app.inject({ method: 'GET', url: '/health' });
       assert.equal(res.statusCode, 200);
       assert.deepEqual(res.json(), { ok: true });
@@ -73,7 +73,7 @@ describe('app API (шаг 5)', () => {
   it('без пароля — API открыто; статус mapped (qr_pending→qr)', async () => {
     const { db, close } = openTestDb();
     try {
-      const app = await createApp({ db, log, wa: mockWa('qr_pending'), scheduler: mockScheduler(), qrPng });
+      const app = await createApp({ db, log, wa: mockWa('qr_pending'), scheduler: mockScheduler(), qrPng, auth: { password: '', allowNoAuth: true } });
       const res = await app.inject({ method: 'GET', url: '/api/whatsapp/status' });
       assert.equal(res.statusCode, 200);
       assert.equal(res.json().state, 'qr');
@@ -88,7 +88,7 @@ describe('app API (шаг 5)', () => {
     try {
       const app = await createApp({
         db, log, wa: mockWa('connected'), scheduler: mockScheduler(), qrPng,
-        auth: { password: 'secret', loginMaxAttempts: 100, loginWindowMs: 60_000 },
+        auth: { password: 'secret', allowNoAuth: false, loginMaxAttempts: 100, loginWindowMs: 60_000 },
       });
       assert.equal((await app.inject({ method: 'GET', url: '/api/whatsapp/status' })).statusCode, 401);
       const bad = await app.inject({ method: 'POST', url: '/api/auth/login', payload: { password: 'nope' } });
@@ -113,7 +113,7 @@ describe('app API (шаг 5)', () => {
     try {
       const app = await createApp({
         db, log, wa: mockWa(), scheduler: mockScheduler(), qrPng,
-        auth: { password: 'secret', loginMaxAttempts: 3, loginWindowMs: 60_000 },
+        auth: { password: 'secret', allowNoAuth: false, loginMaxAttempts: 3, loginWindowMs: 60_000 },
       });
       for (let i = 0; i < 3; i++) {
         await app.inject({ method: 'POST', url: '/api/auth/login', payload: { password: 'nope' } });
@@ -130,7 +130,7 @@ describe('app API (шаг 5)', () => {
     const { db, close } = openTestDb();
     try {
       const wa = mockWa('connected');
-      const app = await createApp({ db, log, wa, scheduler: mockScheduler(), qrPng });
+      const app = await createApp({ db, log, wa, scheduler: mockScheduler(), qrPng, auth: { password: '', allowNoAuth: true } });
       const noConfirm = await app.inject({ method: 'POST', url: '/api/whatsapp/logout', payload: {} });
       assert.equal(noConfirm.statusCode, 400);
       assert.equal(wa.loggedOut, false);
@@ -146,12 +146,12 @@ describe('app API (шаг 5)', () => {
   it('GET /api/whatsapp/qr — PNG data URL; null без QR', async () => {
     const { db, close } = openTestDb();
     try {
-      const app = await createApp({ db, log, wa: mockWa('qr_pending'), scheduler: mockScheduler(), qrPng });
+      const app = await createApp({ db, log, wa: mockWa('qr_pending'), scheduler: mockScheduler(), qrPng, auth: { password: '', allowNoAuth: true } });
       const res = await app.inject({ method: 'GET', url: '/api/whatsapp/qr' });
       assert.equal(res.statusCode, 200);
       assert.match(res.json().dataUrl, /^data:image\/png;base64,/);
       await app.close();
-      const app2 = await createApp({ db, log, wa: mockWa('connected'), scheduler: mockScheduler(), qrPng });
+      const app2 = await createApp({ db, log, wa: mockWa('connected'), scheduler: mockScheduler(), qrPng, auth: { password: '', allowNoAuth: true } });
       assert.deepEqual((await app2.inject({ method: 'GET', url: '/api/whatsapp/qr' })).json().dataUrl, null);
       await app2.close();
     } finally {
@@ -165,7 +165,7 @@ describe('app API (шаг 5)', () => {
       db.run(sql`INSERT INTO chats (jid, display_name, is_group, created_at) VALUES ('a@s.whatsapp.net', 'А', 0, 1)`);
       db.run(sql`INSERT INTO messages (whatsapp_message_id, chat_jid, direction, message_type, timestamp, is_from_me, created_at)
         VALUES ('w1', 'a@s.whatsapp.net', 'incoming', 'text', 1000, 0, 1000)`);
-      const app = await createApp({ db, log, wa: mockWa(), scheduler: mockScheduler(), qrPng });
+      const app = await createApp({ db, log, wa: mockWa(), scheduler: mockScheduler(), qrPng, auth: { password: '', allowNoAuth: true } });
       const res = await app.inject({ method: 'GET', url: '/api/system/status' });
       assert.equal(res.statusCode, 200);
       const body = res.json();

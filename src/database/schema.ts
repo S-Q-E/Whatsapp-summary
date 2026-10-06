@@ -87,6 +87,20 @@ export const jidAliases = sqliteTable('jid_aliases', {
 
 export type JidAliasRow = typeof jidAliases.$inferSelect;
 
+/**
+ * chat_analysis_state — бэкофф анализа по чату (очередь, п.2):
+ * fail_count подряд идущих ошибок, next_attempt_at — когда пробовать снова.
+ * Успешный разбор сбрасывает в 0/NULL. fail_count >= 5 — needs_attention.
+ */
+export const chatAnalysisState = sqliteTable('chat_analysis_state', {
+  chatId: integer('chat_id').primaryKey(),
+  failCount: integer('fail_count').notNull().default(0),
+  nextAttemptAt: integer('next_attempt_at'),
+  updatedAt: integer('updated_at').notNull(),
+});
+
+export type ChatAnalysisStateRow = typeof chatAnalysisState.$inferSelect;
+
 export const TASK_STATUSES = ['open', 'done', 'cancelled', 'needs_review'] as const;
 export type TaskStatus = (typeof TASK_STATUSES)[number];
 
@@ -117,6 +131,12 @@ export const tasks = sqliteTable(
     /** legacy-зеркало chat_id, оставлено для совместимости чтения */
     chatJid: text('chat_jid').notNull(),
     sourceMessageId: integer('source_message_id').references(() => messages.id),
+    /**
+     * Нормализованный хеш названия — ТОЛЬКО для антидубля повторного прогона
+     * (UNIQUE(source_message_id, title_hash)), никогда для идентификации.
+     * NULL у legacy-строк (до шага с хешем) — NULL не конфликтуют.
+     */
+    titleHash: integer('title_hash'),
     closedByMessageId: integer('closed_by_message_id').references(() => messages.id),
     /** open | done | cancelled | needs_review */
     status: text('status').notNull().default('open'),
@@ -141,7 +161,7 @@ export const tasks = sqliteTable(
     manual: integer('manual').notNull().default(0),
   },
   (t) => [
-    uniqueIndex('tasks_source_uidx').on(t.sourceMessageId),
+    uniqueIndex('tasks_source_title_uidx').on(t.sourceMessageId, t.titleHash),
     index('tasks_chat_idx').on(t.chatId),
     index('tasks_status_idx').on(t.status),
   ],
@@ -162,12 +182,12 @@ export const settings = sqliteTable('settings', {
 export type SettingsRow = typeof settings.$inferSelect;
 
 /**
- * chat_settings — настройки по чатам (шаг 9).
- * ignored=1: чат исключён из AI-анализа (тексты не уходят провайдеру),
- * переключается в UI. Сообщения продолжают сохраняться.
+ * chat_settings — настройки по чатам.
+ * Ключ — chat_id (миграция 0008 перенесла со jid): флаг переживает
+ * слияние чатов. ignored=1: чат исключён из AI-анализа.
  */
 export const chatSettings = sqliteTable('chat_settings', {
-  chatJid: text('chat_jid').primaryKey(),
+  chatId: integer('chat_id').primaryKey(),
   ignored: integer('ignored').notNull().default(0),
   updatedAt: integer('updated_at').notNull(),
 });
@@ -187,6 +207,8 @@ export const digests = sqliteTable('digests', {
   sent: integer('sent').notNull().default(0),
   sentAt: integer('sent_at'),
   createdAt: integer('created_at').notNull(),
+  /** метка активной отправки для сериализации параллельных sendToday; NULL = никто не шлёт */
+  sendingAt: integer('sending_at'),
 });
 
 export type DigestRow = typeof digests.$inferSelect;

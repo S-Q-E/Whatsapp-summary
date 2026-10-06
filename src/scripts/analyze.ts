@@ -45,7 +45,8 @@ async function main(): Promise<void> {
   const db = openDatabase(logger);
   const analyzedAt = Date.now();
   try {
-    const bundles = loadPendingBundles(db, { day, chatFilter });
+    // Ручной прогон — явное намерение: бэкофф планировщика игнорируем.
+    const bundles = loadPendingBundles(db, { day, chatFilter, ignoreBackoff: true });
     if (bundles.length === 0) {
       console.log('No unprocessed chats. Nothing to analyze.');
       console.log('Tip: run `npm run seed:demo` to load synthetic demo conversations, then re-run.');

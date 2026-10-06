@@ -44,7 +44,8 @@ export default function Chats() {
     <div className="mx-auto max-w-2xl space-y-3 p-4">
       <h1 className="text-xl font-bold">Чаты</h1>
       <p className="text-sm text-slate-500">
-        Выключенные чаты не отправляются в AI-анализ (сообщения продолжают сохраняться).
+        Переключатель «Анализировать» решает, отправляются ли тексты чата в AI-анализ.
+        Сообщения продолжают сохраняться всегда. Группы по умолчанию не анализируются.
       </p>
       {chats.length === 0 && <div className="text-slate-500">Чатов пока нет.</div>}
       {chats.map((c) => (
@@ -53,15 +54,17 @@ export default function Chats() {
             <div className="truncate text-sm font-medium text-slate-800">
               {c.displayName ?? c.jid} {c.isGroup === 1 && <span title="группа">👥</span>}
             </div>
+            <div className="truncate font-mono text-xs text-slate-400">{c.jid}</div>
             <div className="text-xs text-slate-500">
               {c.messageCount} сообщений{c.ignored === 1 && ' · исключён из анализа'}
             </div>
           </div>
           <button
             onClick={() => void toggle(c)}
+            title={c.ignored === 1 ? 'Включить AI-анализ этого чата' : 'Исключить чат из AI-анализа'}
             className={`shrink-0 rounded-lg px-3 py-1.5 text-sm ${c.ignored === 1 ? 'bg-slate-200 text-slate-600' : 'bg-green-100 text-green-800'}`}
           >
-            {c.ignored === 1 ? 'Включить' : 'Выключить'}
+            {c.ignored === 1 ? 'Анализировать: выкл' : 'Анализировать: вкл'}
           </button>
         </div>
       ))}

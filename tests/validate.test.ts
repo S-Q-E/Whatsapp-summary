@@ -74,37 +74,26 @@ describe('parseModelActions — wire-контракт v3 (шаг 3)', () => {
     assert.equal(dropped.length, 3);
   });
 
-  it('структурные ошибки — AIValidationError (повод для retry)', () => {
+  it('AIValidationError — только если JSON не разобрался или нет массива actions', () => {
     assert.throws(() => parseModelActions('конечно, посмотрю!', INPUT), AIValidationError);
     assert.throws(() => parseModelActions(wrap({}), INPUT), AIValidationError);
-    assert.throws(
-      () => parseModelActions(wrap([{ type: 'update', taskId: null, title: 'X', confidence: 0.5 }]), INPUT),
-      AIValidationError,
-    );
-    assert.throws(
-      () => parseModelActions(wrap([{ type: 'create', taskId: 5, title: 'X', status: 'open', confidence: 0.5 }]), INPUT),
-      AIValidationError,
-    );
-    assert.throws(
-      () => parseModelActions(wrap([{ type: 'complete', title: 'X', confidence: 0.5 }]), INPUT),
-      AIValidationError,
-    );
-    assert.throws(
-      () => parseModelActions(wrap([{ type: 'create', taskId: null, title: '  ', status: 'open', confidence: 0.5 }]), INPUT),
-      AIValidationError,
-    );
-    assert.throws(
-      () => parseModelActions(wrap([{ type: 'create', taskId: null, title: 'X', status: 'done', confidence: 0.5 }]), INPUT),
-      AIValidationError,
-    );
-    assert.throws(
-      () => parseModelActions(wrap([{ type: 'create', taskId: null, title: 'X', status: 'open', confidence: 2 }]), INPUT),
-      AIValidationError,
-    );
-    assert.throws(
-      () => parseModelActions(wrap([{ type: 'create', taskId: null, title: 'X', status: 'open', confidence: 0.5, dueAt: 'когда-нибудь' }]), INPUT),
-      AIValidationError,
-    );
+    assert.throws(() => parseModelActions(wrap(null), INPUT), AIValidationError);
+  });
+
+  it('битые действия отдельных элементов — дроп с причиной, не throw', () => {
+    const bad = [
+      { type: 'update', taskId: null, title: 'X', confidence: 0.5 },
+      { type: 'create', taskId: 5, title: 'X', status: 'open', confidence: 0.5 },
+      { type: 'complete', title: 'X', confidence: 0.5 },
+      { type: 'create', taskId: null, title: '  ', status: 'open', confidence: 0.5 },
+      { type: 'create', taskId: null, title: 'X', status: 'done', confidence: 0.5 },
+      { type: 'create', taskId: null, title: 'X', status: 'open', confidence: 0.5, dueAt: 'когда-нибудь' },
+      'не объект',
+    ];
+    const { actions, dropped } = parseModelActions(wrap(bad), INPUT);
+    assert.equal(actions.length, 0);
+    assert.equal(dropped.length, bad.length);
+    assert.ok(dropped.every((d) => d.startsWith('actions[')));
   });
 
   it('dueAt ISO проходит, лишние поля срезаются', () => {

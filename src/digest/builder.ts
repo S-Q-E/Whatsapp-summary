@@ -117,7 +117,7 @@ export function buildDigest(db: Db, day: Date): DailyDigest {
 
   const unheardVoice = db.get<{ n: number }>(sql`
     SELECT COUNT(*) AS n FROM messages
-    WHERE message_type = 'voice' AND processed_at IS NULL AND deleted_at IS NULL
+    WHERE message_type = 'voice' AND transcript IS NULL AND deleted_at IS NULL
   `);
 
   const withoutDeadline = open.filter((t) => t.dueAt === null).length;

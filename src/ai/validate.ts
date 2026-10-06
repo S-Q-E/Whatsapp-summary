@@ -52,10 +52,13 @@ export type ParsedActions = {
 
 /**
  * Строгая валидация wire-контракта v3 + проверка ссылок.
- * - структурные ошибки (не JSON, нет actions, плохие поля) → AIValidationError
- *   (повод для единственного retry);
- * - ссылки на несуществующие taskId/evidenceMessageId → действие тихо
- *   отбрасывается, причина — в dropped (только id, без текста переписки).
+ * - AIValidationError — только если JSON вообще не разобрался или нет
+ *   массива actions (повод для единственного retry);
+ * - ошибки структуры ОТДЕЛЬНЫХ действий (плохой type/title/confidence/
+ *   dueAt/status, кривой формат ключей) — действие отбрасывается с причиной
+ *   в dropped, остальные применяются;
+ * - ссылки на несуществующие taskId/evidenceMessageId — тоже дроп;
+ * - confidence 1..100 нормализуется в 0..1.
  */
 export function parseModelActions(rawText: string, input: ConversationInput): ParsedActions {
   const raw = extractJsonObject(rawText);
@@ -68,28 +71,27 @@ export function parseModelActions(rawText: string, input: ConversationInput): Pa
 
   const actions: ExtractedTask[] = [];
   const dropped: string[] = [];
-  const problems: string[] = [];
 
   arr.forEach((item, i) => {
     const where = `actions[${i}]`;
     if (!isRecord(item)) {
-      problems.push(`${where}: must be an object`);
+      dropped.push(`${where}: must be an object`);
       return;
     }
     const type = item['type'] as TaskAction | unknown;
     if (type !== 'create' && type !== 'complete' && type !== 'cancel') {
-      problems.push(`${where}.type must be "create", "complete" or "cancel"`);
+      dropped.push(`${where}.type must be "create", "complete" or "cancel"`);
       return;
     }
     let taskId: number | null = null;
     if (type === 'create') {
       if (item['taskId'] !== null && item['taskId'] !== undefined) {
-        problems.push(`${where}.taskId is forbidden for "create"`);
+        dropped.push(`${where}.taskId is forbidden for "create"`);
         return;
       }
     } else {
       if (item['taskId'] === null || item['taskId'] === undefined) {
-        problems.push(`${where}.taskId is required for "${type}"`);
+        dropped.push(`${where}.taskId is required for "${type}"`);
         return;
       }
       const parsed = parseTaskKey(item['taskId']);
@@ -101,12 +103,12 @@ export function parseModelActions(rawText: string, input: ConversationInput): Pa
     }
     const title = optString(item['title'], 200);
     if (!title) {
-      problems.push(`${where}.title must be a non-empty string`);
+      dropped.push(`${where}.title must be a non-empty string`);
       return;
     }
-    const confidence = item['confidence'];
-    if (typeof confidence !== 'number' || !Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
-      problems.push(`${where}.confidence must be a number 0..1`);
+    const confidence = normalizeConfidence(item['confidence']);
+    if (confidence === null) {
+      dropped.push(`${where}.confidence must be a number 0..1 or 1..100`);
       return;
     }
     const rawEvidence = item['evidenceMessageId'];
@@ -122,12 +124,12 @@ export function parseModelActions(rawText: string, input: ConversationInput): Pa
     if (type === 'create') {
       const dueAt = optString(item['dueAt'], 64);
       if (dueAt !== null && Number.isNaN(Date.parse(dueAt))) {
-        problems.push(`${where}.dueAt must be ISO 8601 date/datetime or null`);
+        dropped.push(`${where}.dueAt must be ISO 8601 date/datetime or null`);
         return;
       }
       const status = optString(item['status'], 32) ?? 'open';
       if (status !== 'open' && status !== 'needs_review') {
-        problems.push(`${where}.status must be "open" or "needs_review" for "create"`);
+        dropped.push(`${where}.status must be "open" or "needs_review" for "create"`);
         return;
       }
       actions.push({
@@ -156,8 +158,18 @@ export function parseModelActions(rawText: string, input: ConversationInput): Pa
     }
   });
 
-  if (problems.length > 0) throw new AIValidationError(problems);
   return { actions, dropped };
+}
+
+/**
+ * Нормализация уверенности: 0..1 как есть, 1..100 (проценты) → /100,
+ * остальное (NaN, строки, >100, <0) → null = дроп действия.
+ */
+export function normalizeConfidence(v: unknown): number | null {
+  if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) return null;
+  if (v <= 1) return v;
+  if (v <= 100) return v / 100;
+  return null;
 }
 
 /** Статус для отображения: какие ключи известны (для логов без текста). */

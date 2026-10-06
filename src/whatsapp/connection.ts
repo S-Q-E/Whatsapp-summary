@@ -21,6 +21,7 @@ import { env } from '../config/env.js';
 import { baileysLogger } from '../config/logger.js';
 import type { Db } from '../database/db.js';
 import { normalizeJid } from '../utils/jid.js';
+import { sql } from 'drizzle-orm';
 import { parseWAMessage, extractEditText, toMs, type ProtocolEvent } from './messageParser.js';
 import { createTranscriber } from '../ai/transcriber.js';
 import { processVoiceMessage } from './voice.js';
@@ -29,7 +30,7 @@ import {
   applyRevoke,
   ensureChat,
   mergeChats,
-  recordAlias,
+  recordAliasAndMerge,
   resolveCanonical,
   storeMessage,
   upsertContact,
@@ -236,10 +237,10 @@ export async function startWhatsAppClient(opts: {
     /** PN<->LID пары из ключей сообщений (Baileys 7: remoteJidAlt/participantAlt). */
     const recordKeyAliases = (key: WAMessage['key']): void => {
       if (key.remoteJid && key.remoteJidAlt) {
-        recordAlias(db, log, { aliasJid: key.remoteJid, canonicalJid: key.remoteJidAlt });
+        recordAliasAndMerge(db, log, { aliasJid: key.remoteJid, canonicalJid: key.remoteJidAlt });
       }
       if (key.participant && key.participantAlt) {
-        recordAlias(db, log, { aliasJid: key.participant, canonicalJid: key.participantAlt });
+        recordAliasAndMerge(db, log, { aliasJid: key.participant, canonicalJid: key.participantAlt });
       }
     };
 
@@ -263,21 +264,25 @@ export async function startWhatsAppClient(opts: {
           continue;
         }
         const chatJid = resolveCanonical(db, parsed.chatJid);
-        // Keep an address book for the future AI secretary stage.
+        const chatIsGroup = chatJid.endsWith('@g.us');
+        // Keep an address book. push_name — только для личных jid:
+        // групповому jid чужой pushName не пишется (шаг 5 item 5).
         upsertContact(db, log, {
           jid: chatJid,
-          pushName: m.key.fromMe ? undefined : parsed.pushName,
+          pushName: chatIsGroup || m.key.fromMe ? undefined : parsed.pushName,
         });
         if (!m.key.fromMe) {
           upsertContact(db, log, { jid: parsed.senderJid, pushName: parsed.pushName });
         }
         storeMessage(db, log, parsed);
-        // Шаг 10: голосовые из realtime — в фоновую транскрибацию.
-        // История (backfill) не трогаем: дорого и шумно; игнор-чаты отсекает сам pipeline.
+        if (chatIsGroup) ensureGroupName(chatJid);
+        // Шаг 10: голосовые — в фоновую транскрибацию. Realtime всегда;
+        // из backfill ('append') — только свежие (не старше 24 ч).
+        // Игнор-чаты отсекает сам pipeline.
         if (
-          source === 'realtime' &&
           env.transcribeVoice &&
-          (parsed.messageType === 'voice' || parsed.messageType === 'audio')
+          (parsed.messageType === 'voice' || parsed.messageType === 'audio') &&
+          (source === 'realtime' || parsed.timestampMs > Date.now() - 86_400_000)
         ) {
           const waMsg = m;
           void processVoiceMessage(
@@ -286,7 +291,6 @@ export async function startWhatsAppClient(opts: {
               log,
               transcriber,
               downloadAudio: (w) => downloadMediaMessage(w, 'buffer', {}),
-              tmpDir: env.transcribeTmpDir,
               enabled: true,
             },
             waMsg,
@@ -333,13 +337,13 @@ export async function startWhatsAppClient(opts: {
     // PN<->LID пары из адресной книги (Contact.id + phoneNumber/lid, Baileys 7).
     const recordContactAlias = (c: { id?: string; lid?: string; phoneNumber?: string }): void => {
       if (c.id && c.phoneNumber && c.id !== c.phoneNumber) {
-        recordAlias(db, log, { aliasJid: c.id, canonicalJid: c.phoneNumber });
+        recordAliasAndMerge(db, log, { aliasJid: c.id, canonicalJid: c.phoneNumber });
       }
       if (c.lid && c.phoneNumber && c.lid !== c.phoneNumber) {
-        recordAlias(db, log, { aliasJid: c.lid, canonicalJid: c.phoneNumber });
+        recordAliasAndMerge(db, log, { aliasJid: c.lid, canonicalJid: c.phoneNumber });
       }
       if (c.id && c.lid && c.id !== c.lid) {
-        recordAlias(db, log, { aliasJid: c.id, canonicalJid: c.lid });
+        recordAliasAndMerge(db, log, { aliasJid: c.id, canonicalJid: c.lid });
       }
     };
 
@@ -347,7 +351,7 @@ export async function startWhatsAppClient(opts: {
     s.ev.on('lid-mapping.update', (mapping) => {
       const pairs = Array.isArray(mapping) ? mapping : [mapping];
       for (const p of pairs) {
-        if (p?.pn && p?.lid) recordAlias(db, log, { aliasJid: p.lid, canonicalJid: p.pn });
+        if (p?.pn && p?.lid) recordAliasAndMerge(db, log, { aliasJid: p.lid, canonicalJid: p.pn });
       }
     });
 
@@ -377,12 +381,38 @@ export async function startWhatsAppClient(opts: {
       }
     });
 
-    // Имена групп для чатов (шаг 4.4).
+    // Имена групп для чатов (шаг 4.4): subject — авторитетный источник.
     s.ev.on('groups.upsert', (groups) => {
       for (const g of groups) {
-        if (g.id) ensureChat(db, log, { jid: g.id, displayName: g.subject ?? null });
+        if (g.id) ensureChat(db, log, { jid: g.id, displayName: g.subject ?? null, source: 'group-meta' });
       }
     });
+
+    // Ленивое имя группы: если display_name пуст, один раз тянем
+    // groupMetadata (read-only) и фиксируем subject как имя чата.
+    const groupNamePending = new Set<string>();
+    const ensureGroupName = (chatJid: string): void => {
+      const jid = normalizeJid(chatJid);
+      if (!jid.endsWith('@g.us') || groupNamePending.has(jid)) return;
+      const row = db.get<{ display_name: string | null }>(
+        sql`SELECT display_name FROM chats WHERE jid = ${jid}`,
+      );
+      if (row?.display_name) return;
+      groupNamePending.add(jid);
+      void s
+        .groupMetadata(jid)
+        .then((meta) => {
+          if (meta?.subject) {
+            ensureChat(db, log, { jid, displayName: meta.subject, source: 'group-meta' });
+          }
+        })
+        .catch((err: unknown) => {
+          log.warn({ err, jid }, 'groupMetadata fetch failed, name stays empty');
+        })
+        .finally(() => {
+          groupNamePending.delete(jid);
+        });
+    };
 
     return s;
   };

@@ -5,6 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { AnalyzeScheduler, countUnprocessed } from './ai/analyzeScheduler.js';
+import { chatsNeedingAttention } from './ai/taskService.js';
 import { createProvider } from './ai/providerFactory.js';
 import { env } from './config/env.js';
 import { logger } from './config/logger.js';
@@ -35,9 +36,18 @@ export type AppOptions = {
   scheduler: AppScheduler;
   qrPng: (qr: string | null) => Promise<string | null>;
   /** опущен = авторизация выключена (тесты, локальный 127.0.0.1) */
-  auth?: { password: string; loginMaxAttempts?: number; loginWindowMs?: number };
+  auth?: {
+    password: string;
+    allowNoAuth?: boolean;
+    loginMaxAttempts?: number;
+    loginWindowMs?: number;
+    sessionTtlMs?: number;
+    allowedHosts?: string[];
+  };
   /** опущен = routes дайджеста не регистрируются (старые тесты) */
   digest?: DigestService;
+  /** проксирует X-Forwarded-Proto/For (только за доверенным proxy) */
+  trustProxy?: boolean;
 };
 
 /**
@@ -46,12 +56,20 @@ export type AppOptions = {
  * поэтому покрывается inject-тестами с моками.
  */
 export async function createApp(opts: AppOptions): Promise<FastifyInstance> {
-  const app = Fastify({ loggerInstance: opts.log as unknown as FastifyBaseLogger });
+  const app = Fastify({
+    loggerInstance: opts.log as unknown as FastifyBaseLogger,
+    trustProxy: opts.trustProxy ?? false,
+  });
   const auth = new Auth({
     password: opts.auth?.password ?? '',
+    allowNoAuth: opts.auth?.allowNoAuth,
     loginMaxAttempts: opts.auth?.loginMaxAttempts,
     loginWindowMs: opts.auth?.loginWindowMs,
+    allowedHosts: opts.auth?.allowedHosts,
   });
+  if (auth.openMode) {
+    opts.log.warn('ALLOW_NO_AUTH=true: веб без пароля. Только для локальных тестов!');
+  }
 
   app.addHook('preHandler', authGuard(auth));
 
@@ -69,8 +87,9 @@ export async function createApp(opts: AppOptions): Promise<FastifyInstance> {
       return reply.code(401).send({ error: 'неверный пароль' });
     }
     const token = auth.createSession();
+    const secure = req.protocol === 'https';
     return reply
-      .header('Set-Cookie', auth.sessionCookieHeader(token))
+      .header('Set-Cookie', auth.sessionCookieHeader(token, { secure }))
       .send({ ok: true });
   });
 
@@ -86,11 +105,11 @@ export async function createApp(opts: AppOptions): Promise<FastifyInstance> {
   const webDist = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../web/dist');
   if (fs.existsSync(path.join(webDist, 'index.html'))) {
     await app.register(fastifyStatic, { root: webDist, prefix: '/' });
-    app.setNotFoundHandler((req, reply) => {
-      if (req.url.startsWith('/api/')) {
-        return reply.code(404).send({ error: 'нет такого API' });
-      }
-      return reply.sendFile('index.html');
+    // Default-deny: неизвестные пути — 404, а не index.html.
+    // Безопасно, т.к. фронт на hash-роутинге (deep links на сервер не ходят);
+    // '/' и ассеты отдаёт сам static-плагин.
+    app.setNotFoundHandler((_req, reply) => {
+      return reply.code(404).send({ error: 'нет такого пути' });
     });
     opts.log.info({ webDist }, 'serving frontend static');
   } else {
@@ -100,6 +119,7 @@ export async function createApp(opts: AppOptions): Promise<FastifyInstance> {
   app.get('/api/system/status', async () => ({
     analyze: opts.scheduler.metricsSnapshot(),
     unprocessedMessages: countUnprocessed(opts.db),
+    chatsNeedingAttention: chatsNeedingAttention(opts.db),
   }));
 
   return app;
@@ -110,10 +130,9 @@ export async function createApp(opts: AppOptions): Promise<FastifyInstance> {
  * src/index.ts только вызывает runApp().
  */
 export async function runApp(): Promise<{ app: FastifyInstance; stop: () => Promise<void> }> {
-  if (env.webPassword === '' && env.webHost !== '127.0.0.1') {
+  if (env.webPassword === '' && !env.allowNoAuth) {
     logger.fatal(
-      { webHost: env.webHost },
-      'WEB_PASSWORD пуст, а WEB_HOST не 127.0.0.1 — без пароля сервер наружу не стартует. Задайте WEB_PASSWORD в .env',
+      'WEB_PASSWORD обязателен всегда. Для локальных тестов задайте ALLOW_NO_AUTH=true (только 127.0.0.1!)',
     );
     process.exit(1);
   }
@@ -126,12 +145,14 @@ export async function runApp(): Promise<{ app: FastifyInstance; stop: () => Prom
     getProvider: () => createProvider(),
     intervalMs: env.analyzeIntervalMin * 60_000,
     maxChats: env.analyzeMaxChats,
-    chatTimeoutMs: env.aiTimeoutMs,
+    // Учитывает retry внутри analyzeChat: AI_TIMEOUT_MS на попытку x2 + запас.
+    chatTimeoutMs: env.aiTimeoutMs * 2 + 5000,
     maintenance: {
       sqliteFile: path.resolve(env.sqlitePath),
       backupDir: path.resolve(env.backupDir),
       backupKeepN: env.backupKeepN,
       retentionDays: env.retentionDays,
+      retentionTasksDays: env.retentionTasksDays,
     },
   });
   const qrPng = new QrPng();
@@ -148,7 +169,8 @@ export async function runApp(): Promise<{ app: FastifyInstance; stop: () => Prom
     wa,
     scheduler,
     qrPng: (qr) => qrPng.toDataUrl(qr),
-    auth: { password: env.webPassword },
+    auth: { password: env.webPassword, allowNoAuth: env.allowNoAuth, allowedHosts: env.allowedHosts },
+    trustProxy: env.trustProxy,
     digest: digestService,
   });
 

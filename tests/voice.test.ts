@@ -6,6 +6,7 @@ import path from 'node:path';
 import { sql } from 'drizzle-orm';
 import pino from 'pino';
 import { openTestDb } from './db.js';
+import { setChatIgnored } from '../src/whatsapp/store.js';
 import { buildUserPrompt } from '../src/ai/prompts.js';
 import type { Transcriber } from '../src/ai/transcriber.js';
 import { processVoiceMessage } from '../src/whatsapp/voice.js';
@@ -34,13 +35,12 @@ function seedVoice(db: TestDb, chatJid: string, wamid: string): void {
     VALUES (${wamid}, ${chatJid}, ${chatId}, 'incoming', 'voice', NULL, ${ts}, 0, ${ts})`);
 }
 
-function deps(db: TestDb, tmpDir: string, tr: FakeTranscriber, enabled = true) {
+function deps(db: TestDb, tr: FakeTranscriber, enabled = true) {
   return {
     db,
     log: silent,
     transcriber: tr,
     downloadAudio: async (_m: WAMessage) => Buffer.from('FAKE-OGG-BYTES'),
-    tmpDir,
     enabled,
   };
 }
@@ -52,23 +52,24 @@ const parsedOf = (chatJid: string, wamid: string) => ({
 });
 
 describe('шаг 10: транскрибация голосовых', () => {
-  it('голосовое из разрешённого чата: скачал → транскрибировал → сохранил, файл удалён', async () => {
+  it('голосовое из разрешённого чата: скачал → транскрибировал → сохранил, файла на диске нет', async () => {
     const { db, close } = openTestDb();
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wavoice-'));
+    // заведомо несуществующая папка: если код пишет tmp-файл — упадёт или создаст её
+    const ghostDir = path.join(os.tmpdir(), `wavoice-ghost-${Date.now()}`);
     try {
       seedVoice(db, 'a@s.whatsapp.net', 'v1');
       const tr = new FakeTranscriber();
-      const r = await processVoiceMessage(deps(db, tmp, tr), {} as WAMessage, parsedOf('a@s.whatsapp.net', 'v1'));
+      const r = await processVoiceMessage(deps(db, tr), {} as WAMessage, parsedOf('a@s.whatsapp.net', 'v1'));
       assert.equal(r, 'transcribed');
       assert.equal(tr.calls, 1);
       assert.equal(
         db.get<{ transcript: string | null }>(sql`SELECT transcript FROM messages WHERE whatsapp_message_id = 'v1'`)?.transcript,
         'посмотрите мои анализы вечером',
       );
-      assert.deepEqual(fs.readdirSync(tmp), [], 'аудиофайл должен быть удалён');
+      assert.equal(fs.existsSync(ghostDir), false, 'аудио не должно писаться на диск');
     } finally {
       close();
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(ghostDir, { recursive: true, force: true });
     }
   });
 
@@ -76,10 +77,12 @@ describe('шаг 10: транскрибация голосовых', () => {
     const { db, close } = openTestDb();
     try {
       seedVoice(db, 'b@s.whatsapp.net', 'v2');
-      db.run(sql`INSERT INTO chat_settings (chat_jid, ignored, updated_at) VALUES ('b@s.whatsapp.net', 1, 1)`);
+      db.run(sql`INSERT INTO chats (jid, display_name, is_group, created_at) VALUES ('b@s.whatsapp.net', 'B', 0, 1)
+        ON CONFLICT(jid) DO NOTHING`);
+      setChatIgnored(db, db.get<{ id: number }>(sql`SELECT id FROM chats WHERE jid = 'b@s.whatsapp.net'`)!.id, 1);
       let downloaded = false;
       const tr = new FakeTranscriber();
-      const d = deps(db, os.tmpdir(), tr);
+      const d = deps(db, tr);
       d.downloadAudio = async () => {
         downloaded = true;
         return Buffer.from('x');
@@ -102,7 +105,7 @@ describe('шаг 10: транскрибация голосовых', () => {
     try {
       seedVoice(db, 'a@s.whatsapp.net', 'v3');
       const tr = new FakeTranscriber();
-      const r = await processVoiceMessage(deps(db, os.tmpdir(), tr, false), {} as WAMessage, parsedOf('a@s.whatsapp.net', 'v3'));
+      const r = await processVoiceMessage(deps(db, tr, false), {} as WAMessage, parsedOf('a@s.whatsapp.net', 'v3'));
       assert.equal(r, 'skipped');
       assert.equal(tr.calls, 0);
     } finally {
@@ -110,20 +113,18 @@ describe('шаг 10: транскрибация голосовых', () => {
     }
   });
 
-  it('ошибка ASR: transcript NULL, файл удалён, исключения наружу нет', async () => {
+  it('ошибка ASR: transcript NULL, исключения наружу нет', async () => {
     const { db, close } = openTestDb();
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wavoice-'));
     try {
       seedVoice(db, 'a@s.whatsapp.net', 'v4');
       const tr = new FakeTranscriber();
       tr.fail = true;
-      const r = await processVoiceMessage(deps(db, tmp, tr), {} as WAMessage, parsedOf('a@s.whatsapp.net', 'v4'));
+      const r = await processVoiceMessage(deps(db, tr), {} as WAMessage, parsedOf('a@s.whatsapp.net', 'v4'));
       assert.equal(r, 'failed');
       assert.equal(
         db.get<{ transcript: string | null }>(sql`SELECT transcript FROM messages WHERE whatsapp_message_id = 'v4'`)?.transcript,
         null,
       );
-      assert.deepEqual(fs.readdirSync(tmp), []);
     } finally {
       close();
     }

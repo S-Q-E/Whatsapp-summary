@@ -282,7 +282,7 @@ tests/
    UNIQUE по источнику. `auto`-провайдер не залипает (primary пробуется
    каждый раз); fallback на эвристику выключен по умолчанию
    (`ALLOW_HEURISTIC_FALLBACK=false`), при включении её create → needs_review.
-5. Проверки: `npm test` (116 тестов), `npm run typecheck`, `npm run build`.
+5. Проверки: `npm test` (132 теста), `npm run typecheck`, `npm run build`.
 
 Таблица `tasks`: `chat_id` (FK → chats), `title`, `description`,
 `source_message_id` (FK → messages.id, wamid резолвится при сверке),
@@ -415,12 +415,20 @@ API (`/api`, ответы валидируются Zod):
 | PATCH | `/api/tasks/:id` | `{status, title, description, dueAt}` → `manual=1` |
 | GET | `/api/tasks/:id/context` | ±5 сообщений вокруг источника с флагами `isSource`/`isClosing` |
 | POST | `/api/digest/preview` | текст дайджеста без отправки и без записи |
-| POST | `/api/digest/send-now` | тело `{"confirm": true}` — отправить сейчас (та же идемпотентность) |
+| POST | `/api/digest/send-now` | тело `{"confirm": true}` — отправить сейчас (обходит проверку времени, повтор за день не шлёт) |
 
-Авторизация: сессии в памяти, cookie `wasec` (httpOnly, SameSite=Lax),
-пароль сверяется в constant-time. Без `WEB_PASSWORD` сервер стартует
-только на `127.0.0.1`. QR в терминал выключен по умолчанию
-(`QR_TERMINAL=false`); в WEB — через `/api/whatsapp/qr`.
+Авторизация (default-deny): закрыто всё, кроме `/health`, `/api/health`,
+`POST /api/auth/login` и статики фронта. Решение — по сматченному маршруту
+(`routeOptions`), а не по строке URL: кодированные обходы (`/%61pi/...`)
+дают 401/404, никогда не 200. Сессии в памяти с TTL 7 дней
+(`Max-Age`, чистка просроченных), cookie `wasec` (httpOnly, SameSite=Lax,
+`Secure` под https), пароль сверяется в constant-time, rate limit на логин.
+`WEB_PASSWORD` обязателен всегда; исключение — явный `ALLOW_NO_AUTH=true`
+(только тесты/локалка, сервер громко предупреждает в логе).
+Защита от DNS rebinding: только `127.0.0.1`/`localhost`/`::1` и `ALLOWED_HOSTS`.
+POST/PATCH/DELETE требуют JSON Content-Type или `X-Requested-With`.
+За reverse proxy — `TRUST_PROXY=true` (иначе `X-Forwarded-*` игнорируются).
+QR в терминал выключен по умолчанию (`QR_TERMINAL=false`); в WEB — через `/api/whatsapp/qr`.
 
 ## Шаг 6: дашборд и задачи (API + web/)
 
@@ -466,12 +474,15 @@ API (`/api`, ответы валидируются Zod):
 | Дайджест | Одним сообщением в WhatsApp только на `OWNER_JID` (проверяется `sendGuard`, есть тест). Пациентам приложение не пишет никогда |
 | Логи | Только метаданные (чат, тип, длина). Полный текст — лишь на `debug` при `LOG_MESSAGE_CONTENT=true` (тест `tests/ops.test.ts` это проверяет) |
 | Медиафайлы | Не скачиваются и не хранятся вообще — кроме голосовых при включённой транскрибации (ниже) |
-| Аудио голосовых → ASR | **Только при `TRANSCRIBE_VOICE=true` (по умолчанию ВЫКЛЮЧЕНО).** Аудиофайл голосового сообщения скачивается из WhatsApp и отправляется стороннему сервису транскрибации (`TRANSCRIBE_URL`, default OpenAI `/audio/transcriptions`, модель `TRANSCRIBE_MODEL`, ключ `TRANSCRIBE_API_KEY`). Текст ответа хранится в `messages.transcript` и попадает в AI-контекст с пометкой `[голосовое]`. Сам аудиофайл удаляется сразу после распознавания (успех и ошибка) и нигде не хранится. Скачиваются только realtime-сообщения типов `voice`/`audio` из чатов, не исключённых в «Чатах». История (backfill) не транскрибируется |
+| Аудио голосовых → ASR | **Только при `TRANSCRIBE_VOICE=true` (по умолчанию ВЫКЛЮЧЕНО).** Аудио голосового сообщения скачивается из WhatsApp **в память** (на диск не пишется вообще) и отправляется стороннему сервису транскрибации (`TRANSCRIBE_URL`, default OpenAI `/audio/transcriptions`, модель `TRANSCRIBE_MODEL`, ключ `TRANSCRIBE_API_KEY`, язык `TRANSCRIBE_LANGUAGE`, default `auto` = не передаётся). Текст ответа хранится в `messages.transcript` и попадает в AI-контекст с пометкой `[голосовое]`. Скачиваются realtime-сообщения типов `voice`/`audio` из разрешённых чатов плюс свежие (до 24 ч) из backfill. Молодые голосовые без транскрипта не спешат в анализ: ждут `VOICE_GRACE_MIN` (default 5) минут |
 
 Исключение чата из анализа: раздел «Чаты» в UI (переключатель) или
 `chat_settings` в БД — сообщения продолжают сохраняться, но в AI-контекст
-чат не попадает. Ретеншн (`RETENTION_DAYS`, default 0 = выкл): тексты
-сообщений старше срока зануляются, задачи/ссылки/метаданные остаются.
+чат не попадает. Ретеншн (`RETENTION_DAYS`, default 0 = выкл): у сообщений
+старше срока зануляются `text`, `transcript` и `sender_name`; удалённые
+чистятся сразу; старые `digests.content` — тоже; закрытые задачи старше
+`RETENTION_TASKS_DAYS` (default 0 = выкл) обезличиваются. Задачи, ссылки
+и метаданные остаются. После прогона — `wal_checkpoint(TRUNCATE)`.
 
 ## Голосовые сообщения (шаг 10)
 
@@ -484,22 +495,25 @@ TRANSCRIBE_VOICE=true
 TRANSCRIBE_URL=https://api.openai.com/v1   # или Groq: https://api.groq.com/openai/v1
 TRANSCRIBE_MODEL=whisper-1
 TRANSCRIBE_API_KEY=sk-...
+TRANSCRIBE_LANGUAGE=auto   # ru/en/... или auto (не передавать)
 ```
 
-Как это работает: новое голосовое из разрешённого чата скачивается во
-временную папку (`TRANSCRIBE_TMP_DIR`, default `./data/tmp`), отправляется
-в ASR, текст пишется в `messages.transcript`, файл удаляется сразу
-(проверено тестом `tests/voice.test.ts` — директория остаётся пустой).
-Ошибки ASR не роняют ingestion, транскрипт остаётся NULL. В AI-контекст
-транскрипт попадает как `[голосовое: <текст>]`.
+Как это работает: новое голосовое из разрешённого чата скачивается
+в память (на диск не пишется — проверено тестом: несуществующая папка
+так и не создаётся), отправляется в ASR, текст пишется в
+`messages.transcript`, а `processed_at` сбрасывается — сообщение с новым
+транскриптом попадёт в следующий проход анализа. Ошибки ASR не роняют
+ingestion, транскрипт остаётся NULL. В AI-контекст транскрипт попадает
+как `[голосовое: <текст>]`.
 
 ## Docker, бэкапы, обновление
 
 - `docker compose up -d --build` — multi-stage образ (фронт + бэкенд),
   том `./data` (БД, auth, бэкапы), healthcheck по `/api/health`,
   `TZ` берётся из `TIMEZONE`. Порт наружу не торчит дальше `127.0.0.1`.
-- Бэкапы: раз в сутки SQLite `.backup()` в `data/backups`, ротация
-  последних `BACKUP_KEEP_N` (default 7). Auth-папка не копируется —
+- Бэкапы: не чаще раза в календарные сутки SQLite `.backup()` в `data/backups`
+  (проверяется дата последнего файла), ротация последних `BACKUP_KEEP_N`
+  (default 7). Auth-папка не копируется —
   при потере `./data/auth` просто перепривяжи устройство (ниже).
 - Обновление кода: `git pull`, пересобери (`docker compose up -d --build`
   или `npm run build`), миграции применятся сами при старте.

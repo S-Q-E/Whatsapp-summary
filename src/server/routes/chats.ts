@@ -39,15 +39,15 @@ export async function chatsRoutes(app: FastifyInstance, db: Db): Promise<void> {
     )) {
       counts.set(r.chat_id, r.n);
     }
-    const ignored = new Map<string, number>();
-    for (const r of db.all<{ chat_jid: string; ignored: number }>(
-      sql`SELECT chat_jid, ignored FROM chat_settings`,
+    const ignored = new Map<number, number>();
+    for (const r of db.all<{ chat_id: number; ignored: number }>(
+      sql`SELECT chat_id, ignored FROM chat_settings`,
     )) {
-      ignored.set(r.chat_jid, r.ignored);
+      ignored.set(r.chat_id, r.ignored);
     }
     const list = rows.map((r) => ({
       ...r,
-      ignored: ignored.get(r.jid) ?? 0,
+      ignored: ignored.get(r.id) ?? 0,
       messageCount: counts.get(r.id) ?? 0,
     }));
     const parsed = z.array(ChatShape).safeParse(list);
@@ -64,9 +64,9 @@ export async function chatsRoutes(app: FastifyInstance, db: Db): Promise<void> {
     if (found.length === 0) return reply.code(404).send({ error: 'чат не найден' });
     const now = Date.now();
     await db.run(sql`
-      INSERT INTO chat_settings (chat_jid, ignored, updated_at)
-      VALUES (${found[0]!.jid}, ${body.data.ignored}, ${now})
-      ON CONFLICT(chat_jid) DO UPDATE SET ignored = excluded.ignored, updated_at = excluded.updated_at
+      INSERT INTO chat_settings (chat_id, ignored, updated_at)
+      VALUES (${id}, ${body.data.ignored}, ${now})
+      ON CONFLICT(chat_id) DO UPDATE SET ignored = excluded.ignored, updated_at = excluded.updated_at
     `);
     return reply.send({ id, jid: found[0]!.jid, ignored: body.data.ignored });
   });

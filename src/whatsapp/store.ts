@@ -10,7 +10,10 @@ function now(): number {
   return Date.now();
 }
 
-/** Upsert a contact row by normalized JID. Cheap, idempotent. */
+/** Upsert a contact row by normalized JID. Cheap, idempotent.
+ * push_name пишется только для личных jid: у групповых jid (@g.us)
+ * pushName чужой реплики не должен становиться именем чата/контакта.
+ */
 export function upsertContact(
   db: Db,
   log: Logger,
@@ -18,12 +21,13 @@ export function upsertContact(
 ): void {
   const jid = normalizeJid(input.jid);
   if (!jid) return;
+  const pushName = jid.endsWith('@g.us') ? null : (input.pushName ?? null);
   const t = now();
   const phone = phoneFromJid(jid);
   try {
     db.run(sql`
       INSERT INTO contacts (jid, phone, name, push_name, created_at, updated_at)
-      VALUES (${jid}, ${phone}, ${input.name ?? null}, ${input.pushName ?? null}, ${t}, ${t})
+      VALUES (${jid}, ${phone}, ${input.name ?? null}, ${pushName}, ${t}, ${t})
       ON CONFLICT(jid) DO UPDATE SET
         phone = COALESCE(excluded.phone, contacts.phone),
         name = COALESCE(excluded.name, contacts.name),
@@ -35,30 +39,63 @@ export function upsertContact(
   }
 }
 
+/** Источник имени чата: пишут только group-meta (группы) и incoming-message (лички). */
+export type ChatNameSource = 'group-meta' | 'incoming-message' | 'chat-message' | 'own-message';
+
 /**
  * Гарантирует строку в chats и возвращает её id.
- * displayName — лучшее известное имя (push_name контакта/чата).
+ * - группы (@g.us): display_name пишется ТОЛЬКО из group-meta
+ *   (groups.upsert / groupMetadata subject), реплики его не трогают;
+ * - лички: display_name пишется только pushName'ом ВХОДЯЩИХ сообщений,
+ *   собственные сообщения имя не меняют.
  */
 export function ensureChat(
   db: Db,
   log: Logger,
-  input: { jid: string; displayName?: string | null },
+  input: { jid: string; displayName?: string | null; source: ChatNameSource },
 ): number | null {
   const jid = normalizeJid(input.jid);
   if (!jid) return null;
   const t = now();
   const isGroup = jid.endsWith('@g.us') ? 1 : 0;
+  const writable =
+    (isGroup === 1 && input.source === 'group-meta') ||
+    (isGroup === 0 && input.source === 'incoming-message');
   try {
     db.run(sql`
       INSERT INTO chats (jid, display_name, is_group, created_at)
-      VALUES (${jid}, ${input.displayName ?? null}, ${isGroup}, ${t})
+      VALUES (${jid}, ${writable ? (input.displayName ?? null) : null}, ${isGroup}, ${t})
       ON CONFLICT(jid) DO UPDATE SET
-        display_name = COALESCE(excluded.display_name, chats.display_name)
+        display_name = CASE
+          WHEN ${writable ? 1 : 0} = 1 THEN COALESCE(excluded.display_name, chats.display_name)
+          ELSE chats.display_name
+        END
     `);
     return db.get<{ id: number }>(sql`SELECT id FROM chats WHERE jid = ${jid}`)?.id ?? null;
   } catch (err) {
     log.warn({ err, jid }, 'chat ensure failed');
     return null;
+  }
+}
+
+/** Ручная установка флага игнорирования чата (UI, тесты). */
+export function setChatIgnored(db: Db, chatId: number, ignored: 0 | 1): void {
+  db.run(sql`
+    INSERT INTO chat_settings (chat_id, ignored, updated_at)
+    VALUES (${chatId}, ${ignored}, ${now()})
+    ON CONFLICT(chat_id) DO UPDATE SET ignored = excluded.ignored, updated_at = excluded.updated_at
+  `);
+}
+
+/** Читает флаг игнорирования чата (false, если строки нет). */
+export function isChatIgnored(db: Db, chatId: number): boolean {
+  try {
+    const row = db.get<{ ignored: number }>(
+      sql`SELECT ignored FROM chat_settings WHERE chat_id = ${chatId}`,
+    );
+    return (row?.ignored ?? 0) === 1;
+  } catch {
+    return false;
   }
 }
 
@@ -70,7 +107,12 @@ export function ensureChat(
 export function storeMessage(db: Db, log: Logger, p: ParsedMessage): StoreResult {
   const chatJid = resolveCanonical(db, p.chatJid);
   const senderJid = resolveCanonical(db, p.senderJid);
-  const chatId = ensureChat(db, log, { jid: chatJid, displayName: p.senderName ?? p.pushName });
+  // Имя чата — только из входящих личных сообщений; своё и групповые реплики не пишут.
+  const chatId = ensureChat(db, log, {
+    jid: chatJid,
+    displayName: p.isFromMe ? undefined : (p.senderName ?? p.pushName),
+    source: chatJid.endsWith('@g.us') ? 'chat-message' : p.isFromMe ? 'own-message' : 'incoming-message',
+  });
   try {
     const res = db.run(sql`
       INSERT INTO messages
@@ -122,46 +164,83 @@ export function resolveCanonical(db: Db, jid: string): string {
   }
 }
 
+export type AliasRecord = { isNew: boolean; aliasJid: string; canonicalJid: string };
+
 /**
  * Записывает алиас aliasJid -> canonicalJid. Каноника: PN побеждает LID
  * (номер стабилен и совпадает с адресной книгой); иначе первый увиденный.
- * Идемпотентно: повтор и сам-на-себя — no-op.
+ * Возвращает флаг «новая пара» и итоговое направление — по нему вызывающий
+ * запускает слияние чатов. Повтор и сам-на-себя — no-op (isNew false).
  */
 export function recordAlias(
   db: Db,
   log: Logger,
   input: { aliasJid: string; canonicalJid: string },
-): void {
-  const a = normalizeJid(input.aliasJid);
-  const c = normalizeJid(input.canonicalJid);
-  if (!a || !c || a === c) return;
+): AliasRecord {
+  const noop = { isNew: false, aliasJid: normalizeJid(input.aliasJid), canonicalJid: normalizeJid(input.canonicalJid) };
+  const a = noop.aliasJid;
+  const c = noop.canonicalJid;
+  if (!a || !c || a === c) return noop;
   // PN всегда каноника: если алиас — PN, а каноника — LID, меняем направление
   if (isPnJid(a) && !isPnJid(c)) {
-    recordAlias(db, log, { aliasJid: c, canonicalJid: a });
-    return;
+    return recordAlias(db, log, { aliasJid: c, canonicalJid: a });
   }
   try {
-    db.run(sql`
+    const res = db.run(sql`
       INSERT INTO jid_aliases (alias_jid, canonical_jid, created_at)
       VALUES (${a}, ${c}, ${now()})
       ON CONFLICT(alias_jid) DO NOTHING
     `);
+    const isNew = Number(res.changes ?? 0) > 0;
+    return { isNew, aliasJid: a, canonicalJid: c };
   } catch (err) {
     log.warn({ err, alias: a }, 'alias record failed');
+    return noop;
   }
 }
 
+/**
+ * Связка «алиас → слияние» для connection.ts: при новой паре сливает
+ * чаты (алиасный в канонический), иначе no-op (null). Вызывать только
+ * для свежих пар — внутри всё равно идемпотентно.
+ */
+export function recordAliasAndMerge(
+  db: Db,
+  log: Logger,
+  input: { aliasJid: string; canonicalJid: string },
+): MergeResult | null {
+  const rec = recordAlias(db, log, input);
+  if (!rec.isNew) return null;
+  const fromRow = db.get<{ id: number }>(
+    sql`SELECT id FROM chats WHERE jid = ${rec.aliasJid}`,
+  );
+  if (!fromRow) return null; // сливать нечего — чата-источника нет
+  return mergeChats(db, log, { fromJid: rec.aliasJid, intoJid: rec.canonicalJid });
+}
+
 export type MergeResult = { messagesMoved: number; tasksMoved: number };
+export type MergeStep = 'dedupe' | 'move' | 'settings' | 'contacts' | 'cleanup';
+export type MergeOptions = {
+  /** тестовый хук: бросить ошибку после указанного шага (проверка отката) */
+  failAfter?: MergeStep;
+};
 
 /**
- * Сливает чат fromJid в intoJid (поздний алиас): сообщения и задачи
- * перепривязываются, пустой чат удаляется. Всё в одной транзакции:
+ * Сливает чат fromJid в intoJid (поздний алиас). Всё в одной транзакции:
  * либо переехало всё, либо ничего.
+ * - сообщения-дубли (тот же wamid уже есть в into) удаляются, а ссылки
+ *   задач source/closed_by перепривязываются на выжившее сообщение;
+ * - остальные сообщения и задачи переезжают (chat_id + chat_jid);
+ * - флаг ignored = OR из обоих чатов;
+ * - контакты: push_name/name/phone алиасного jid подтягиваются в
+ *   канонический при пустотах, затем алиасная строка удаляется;
+ * - пустой чат удаляется.
  */
 export function mergeChats(
   db: Db,
   log: Logger,
   input: { fromJid: string; intoJid: string },
+  opts: MergeOptions = {},
 ): MergeResult {
   const from = normalizeJid(input.fromJid);
   const into = normalizeJid(input.intoJid);
@@ -187,10 +266,26 @@ export function mergeChats(
   }
   const intoRow = { id: intoId };
   const res: MergeResult = { messagesMoved: 0, tasksMoved: 0 };
+  const failAfter = opts.failAfter;
+  const maybeFail = (step: MergeStep): void => {
+    if (failAfter === step) throw new Error(`inject: failAfter ${step}`);
+  };
   db.run(sql`BEGIN`);
   try {
-    // id сообщений уникальны в пределах аккаунта — конфликта
-    // UNIQUE(whatsapp_message_id, chat_jid) при смене chat_jid быть не может.
+    // 1. Дедупликация: тот же wamid в обоих чатах — дубль удаляем,
+    // ссылки задач перепривязываем на выжившее сообщение.
+    const dups = db.all<{ dup_id: number; keep_id: number }>(sql`
+      SELECT m1.id AS dup_id, m2.id AS keep_id
+      FROM messages m1 JOIN messages m2 ON m2.whatsapp_message_id = m1.whatsapp_message_id
+      WHERE m1.chat_id = ${fromRow.id} AND m2.chat_id = ${intoRow.id}
+    `);
+    for (const d of dups) {
+      db.run(sql`UPDATE tasks SET source_message_id = ${d.keep_id} WHERE source_message_id = ${d.dup_id}`);
+      db.run(sql`UPDATE tasks SET closed_by_message_id = ${d.keep_id} WHERE closed_by_message_id = ${d.dup_id}`);
+      db.run(sql`DELETE FROM messages WHERE id = ${d.dup_id}`);
+    }
+    maybeFail('dedupe');
+    // 2. Переезд оставшихся сообщений и задач.
     const m = db.run(sql`
       UPDATE messages SET chat_jid = ${into}, chat_id = ${intoRow.id}
       WHERE chat_id = ${fromRow.id}
@@ -201,7 +296,44 @@ export function mergeChats(
       WHERE chat_id = ${fromRow.id}
     `);
     res.tasksMoved = Number(t.changes ?? 0);
+    maybeFail('move');
+    // 3. Настройки: ignored = OR.
+    const fromIgn = db.get<{ ignored: number }>(
+      sql`SELECT ignored FROM chat_settings WHERE chat_id = ${fromRow.id}`,
+    )?.ignored ?? 0;
+    const intoIgn = db.get<{ ignored: number }>(
+      sql`SELECT ignored FROM chat_settings WHERE chat_id = ${intoRow.id}`,
+    )?.ignored ?? 0;
+    if (fromIgn === 1 || intoIgn === 1) {
+      db.run(sql`
+        INSERT INTO chat_settings (chat_id, ignored, updated_at)
+        VALUES (${intoRow.id}, 1, ${now()})
+        ON CONFLICT(chat_id) DO UPDATE SET ignored = 1, updated_at = excluded.updated_at
+      `);
+    }
+    db.run(sql`DELETE FROM chat_settings WHERE chat_id = ${fromRow.id}`);
+    maybeFail('settings');
+    // 4. Контакты: подтягиваем пустые поля канонического из алиасного,
+    // затем алиасную строку удаляем (маппинг живёт в jid_aliases).
+    const fromC = db.get<{ name: string | null; push_name: string | null; phone: string | null }>(
+      sql`SELECT name, push_name, phone FROM contacts WHERE jid = ${from}`,
+    );
+    if (fromC) {
+      db.run(sql`
+        INSERT INTO contacts (jid, phone, name, push_name, created_at, updated_at)
+        VALUES (${into}, ${fromC.phone}, ${fromC.name}, ${fromC.push_name}, ${now()}, ${now()})
+        ON CONFLICT(jid) DO UPDATE SET
+          phone = COALESCE(contacts.phone, excluded.phone),
+          name = COALESCE(contacts.name, excluded.name),
+          push_name = COALESCE(contacts.push_name, excluded.push_name),
+          updated_at = excluded.updated_at
+      `);
+      db.run(sql`DELETE FROM contacts WHERE jid = ${from}`);
+    }
+    maybeFail('contacts');
+    // 5. Пустой чат удаляем.
     db.run(sql`DELETE FROM chats WHERE id = ${fromRow.id}`);
+    maybeFail('cleanup');
     db.run(sql`COMMIT`);
   } catch (err) {
     try {
@@ -209,6 +341,7 @@ export function mergeChats(
     } catch {
       // ignore rollback errors, исходная ошибка важнее
     }
+    if (failAfter) throw err;
     log.warn({ err, from, into }, 'chat merge failed, rolled back');
     return empty;
   }

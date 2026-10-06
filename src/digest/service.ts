@@ -19,9 +19,20 @@ export type DigestServiceOpts = {
 
 export type SendResult = {
   sent: boolean;
-  reason: 'sent' | 'already-sent' | 'too-early' | 'no-owner' | 'offline' | 'send-failed';
+  reason: 'sent' | 'already-sent' | 'too-early' | 'no-owner' | 'offline' | 'send-failed' | 'sending';
   dateIso: string;
 };
+
+export type SendOptions = {
+  nowMs?: number;
+  /** обойти проверку времени (кнопка «Отправить сейчас»), но НЕ already-sent */
+  force?: boolean;
+  /** отправить повторно, даже если сегодня уже отправлялось */
+  resend?: boolean;
+};
+
+/** TTL метки активной отправки: зависший sender не блокирует навсегда. */
+const SENDING_TTL_MS = 5 * 60_000;
 
 function sendMomentMs(nowMs: number, timezone: string, digestTime: string): number {
   const [h, m] = digestTime.split(':').map(Number);
@@ -34,6 +45,9 @@ function sendMomentMs(nowMs: number, timezone: string, digestTime: string): numb
  * Рестарт и офлайн оставляют sent=0 — следующий тик повторяет.
  */
 export class DigestService {
+  /** очередь отправок: параллельные вызовы идут строго друг за другом */
+  private sendQueue: Promise<void> = Promise.resolve();
+
   constructor(
     private readonly db: Db,
     private readonly log: Logger,
@@ -47,38 +61,67 @@ export class DigestService {
     return { dateIso: digest.dateIso, content: renderWhatsAppDigest(digest, this.opts.timezone) };
   }
 
-  async sendToday(reason: string, nowMs: number = Date.now()): Promise<SendResult> {
+  async sendToday(reason: string, opts?: SendOptions | number): Promise<SendResult> {
+    const prev = this.sendQueue;
+    let release!: () => void;
+    this.sendQueue = new Promise<void>((r) => {
+      release = r;
+    });
+    await prev;
+    try {
+      return await this.doSend(reason, opts);
+    } finally {
+      release();
+    }
+  }
+
+  private async doSend(reason: string, opts?: SendOptions | number): Promise<SendResult> {
+    const o: SendOptions = typeof opts === 'number' ? { nowMs: opts } : (opts ?? {});
+    const nowMs = o.nowMs ?? Date.now();
     const { timezone, digestTime, ownerJid } = this.opts;
     const dateIso = toLocalDateString(nowMs, timezone);
     const existing = this.db.get<{ sent: number }>(sql`SELECT sent FROM digests WHERE date = ${dateIso}`);
-    if (existing?.sent === 1) return { sent: false, reason: 'already-sent', dateIso };
-    if (nowMs < sendMomentMs(nowMs, timezone, digestTime)) {
+    if (existing?.sent === 1 && !o.resend) return { sent: false, reason: 'already-sent', dateIso };
+    if (!o.force && nowMs < sendMomentMs(nowMs, timezone, digestTime)) {
       return { sent: false, reason: 'too-early', dateIso };
     }
     if (!ownerJid.trim()) {
       this.log.warn({ dateIso }, 'digest due but OWNER_JID empty, skipping');
       return { sent: false, reason: 'no-owner', dateIso };
     }
+    // DB-статус отправки: чужой свежий маркер (другой процесс) — не дублируем.
+    const marking = this.db.get<{ sending_at: number | null }>(
+      sql`SELECT sending_at FROM digests WHERE date = ${dateIso}`,
+    );
+    if (marking?.sending_at !== null && marking?.sending_at !== undefined && nowMs - marking.sending_at < SENDING_TTL_MS) {
+      return { sent: false, reason: 'sending', dateIso };
+    }
     const { content } = this.preview(new Date(nowMs));
     const now = Date.now();
     this.db.run(sql`
-      INSERT INTO digests (date, content, sent, created_at)
-      VALUES (${dateIso}, ${content}, 0, ${now})
-      ON CONFLICT(date) DO UPDATE SET content = excluded.content
+      INSERT INTO digests (date, content, sent, created_at, sending_at)
+      VALUES (${dateIso}, ${content}, 0, ${now}, ${now})
+      ON CONFLICT(date) DO UPDATE SET content = excluded.content, sending_at = excluded.sending_at
     `);
     if (!this.transport.isConnected()) {
+      this.clearSending(dateIso);
       this.log.warn({ dateIso }, 'digest due but WhatsApp offline, will retry');
       return { sent: false, reason: 'offline', dateIso };
     }
     try {
       await this.transport.sendDigestText(content);
     } catch (err) {
+      this.clearSending(dateIso);
       this.log.warn({ err, dateIso }, 'digest send failed, will retry');
       return { sent: false, reason: 'send-failed', dateIso };
     }
-    this.db.run(sql`UPDATE digests SET sent = 1, sent_at = ${Date.now()} WHERE date = ${dateIso}`);
+    this.db.run(sql`UPDATE digests SET sent = 1, sent_at = ${Date.now()}, sending_at = NULL WHERE date = ${dateIso}`);
     this.log.info({ dateIso, reason }, 'digest sent to owner');
     return { sent: true, reason: 'sent', dateIso };
+  }
+
+  private clearSending(dateIso: string): void {
+    this.db.run(sql`UPDATE digests SET sending_at = NULL WHERE date = ${dateIso}`);
   }
 }
 

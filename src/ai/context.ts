@@ -1,4 +1,5 @@
 import type {
+  ClosedTaskSummary,
   ConversationInput,
   ConversationMessage,
   ExistingTaskSummary,
@@ -50,8 +51,9 @@ export type PromptContext = {
 };
 
 /**
- * Собирает контекст чата для модели: сообщения бандла (уже отобранные
- * loadPendingBundles: последние N за 14 дней) + все открытые задачи чата.
+ * Собирает контекст чата для модели: сообщения окна (уже отобранные
+ * вызывающим: последние N или следующее окно) + все открытые задачи чата
+ * + недавно закрытые (чтобы модель их не воскрешала).
  * Здесь же фиксируются множества известных id для проверки ссылок.
  */
 export function buildPromptContext(
@@ -59,17 +61,19 @@ export function buildPromptContext(
   openTasks: ExistingTaskSummary[],
   analyzedAt: number,
   timezone: string,
+  recentlyClosed: ClosedTaskSummary[] = [],
 ): PromptContext {
   const input: ConversationInput = {
     chatJid: bundle.chatJid,
     contactName: bundle.contactName,
     messages: bundle.messages,
     existingTasks: openTasks,
+    recentlyClosed,
     analyzedAt,
   };
   return {
     input,
-    knownTaskIds: new Set(openTasks.map((t) => t.id)),
+    knownTaskIds: new Set([...openTasks, ...recentlyClosed].map((t) => t.id)),
     knownMessageIds: new Set(bundle.messages.map((m) => m.id)),
     timezone,
   };

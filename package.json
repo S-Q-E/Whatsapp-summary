@@ -15,7 +15,7 @@
     "start": "node dist/index.js",
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "TZ=UTC node --import tsx --test tests/validate.test.ts tests/reconcile.test.ts tests/reconcile-bugs.test.ts tests/heuristicFixtures.test.ts tests/digest.test.ts tests/openrouter.test.ts tests/settings.test.ts tests/whatsapp-status.test.ts tests/whatsapp-routes.test.ts tests/time.test.ts tests/migrate.test.ts tests/env.test.ts tests/analyze3.test.ts tests/whatsapp-ingest.test.ts tests/app.test.ts tests/dashboard.test.ts tests/digest-send.test.ts tests/eval.test.ts tests/ops.test.ts tests/voice.test.ts",
+    "test": "TZ=UTC node --import tsx --test tests/*.test.ts",
     "analyze": "tsx src/scripts/analyze.ts",
     "digest": "tsx src/scripts/digest.ts",
     "seed:demo": "tsx src/scripts/seedDemo.ts",

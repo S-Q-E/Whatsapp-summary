@@ -3,7 +3,7 @@ import type { Logger } from 'pino';
 import type { Db } from '../database/db.js';
 import { runBackup } from '../ops/backup.js';
 import { runRetention } from '../ops/retention.js';
-import { analyzeChat, loadPendingBundles } from './taskService.js';
+import { analyzeChat, loadPendingBundles, recordChatFailure, resetChatState } from './taskService.js';
 import type { AIProvider } from './types.js';
 
 export type AnalyzeMetrics = {
@@ -38,6 +38,7 @@ export type SchedulerOptions = {
     backupDir: string;
     backupKeepN: number;
     retentionDays: number;
+    retentionTasksDays?: number;
   };
 };
 
@@ -59,6 +60,8 @@ export type TickResult = {
 export class AnalyzeScheduler {
   private timer: ReturnType<typeof setInterval> | null = null;
   private running = false;
+  /** Чаты, разбираемые прямо сейчас — защита от параллельного разбора одного чата. */
+  private readonly inFlight = new Set<number>();
   private lastMaintenance = 0;
   private readonly metrics: AnalyzeMetrics = {
     lastRunAt: null,
@@ -104,24 +107,41 @@ export class AnalyzeScheduler {
     const res: TickResult = { started: true, chats: 0, created: 0, updated: 0, skipped: 0 };
     try {
       await this.maybeMaintain(now());
-      const bundles = loadPendingBundles(db, {}).slice(0, this.opts.maxChats);
+      // Чаты уже отсортированы от старых к новым, бэкофф исключён в запросе.
+      const bundles = loadPendingBundles(db, { now: now() }).slice(0, this.opts.maxChats);
+      if (bundles.length === 0) {
+        this.metrics.lastRunAt = now();
+        this.metrics.lastDurationMs = now() - t0;
+        this.metrics.lastChats = 0;
+        this.metrics.runCount += 1;
+        return res;
+      }
       const provider = this.opts.getProvider();
       const analyzedAt = now();
       for (const b of bundles) {
+        if (this.inFlight.has(b.chatId)) continue;
+        this.inFlight.add(b.chatId);
         res.chats += 1;
         try {
           const r = await this.withTimeout(
             analyzeChat(db, log, provider, b, analyzedAt),
             this.opts.chatTimeoutMs,
           );
+          resetChatState(db, b.chatId, now());
           res.created += r.created.length;
           res.updated += r.updated.length;
           res.skipped += r.skipped;
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
+          const st = recordChatFailure(db, b.chatId, now());
           this.metrics.providerErrorCount += 1;
           this.metrics.lastProviderError = msg.slice(0, 300);
-          log.warn({ err: msg, chat: b.chatJid }, 'scheduled chat analysis failed, will retry next pass');
+          log.warn(
+            { err: msg, chat: b.chatJid, failCount: st.failCount, nextAttemptAt: st.nextAttemptAt },
+            'scheduled chat analysis failed, backing off',
+          );
+        } finally {
+          this.inFlight.delete(b.chatId);
         }
       }
       this.metrics.lastRunAt = now();
@@ -148,7 +168,7 @@ export class AnalyzeScheduler {
     this.lastMaintenance = nowMs;
     const { db, log } = this.opts;
     try {
-      runRetention(db, log, { days: m.retentionDays, now: nowMs });
+      runRetention(db, log, { days: m.retentionDays, tasksDays: m.retentionTasksDays, now: nowMs });
     } catch (err) {
       log.warn({ err }, 'maintenance: retention failed');
     }

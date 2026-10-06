@@ -34,8 +34,14 @@ const envSchema = z.object({
     (v) => (v === '' || v === undefined ? undefined : Number(v)),
     z.number({ error: 'WEB_PORT: нужен номер порта, например 3000' }).int().min(1).max(65_535).default(3000),
   ),
-  /** Пароль веб-интерфейса (пусто = пока без авторизации, закроем следующим шагом). */
+  /** Пароль веб-интерфейса. Обязателен всегда, кроме явного ALLOW_NO_AUTH. */
   WEB_PASSWORD: optString(''),
+  /** явный флаг тестов/локалки; без него пустой пароль = отказ в старте */
+  ALLOW_NO_AUTH: optBool(false),
+  /** доверять X-Forwarded-* от proxy (иначе игнорируются) */
+  TRUST_PROXY: optBool(false),
+  /** дополнительные Host сверх 127.0.0.1/localhost, через запятую */
+  ALLOWED_HOSTS: optString(''),
 
   // --- Время: единая зона для границ дня, промпта и UI ---
   TIMEZONE: optString('Asia/Almaty').superRefine((tz, ctx) => {
@@ -80,6 +86,11 @@ const envSchema = z.object({
     (v) => (v === '' || v === undefined ? undefined : Number(v)),
     z.number({ error: 'AI_CONTEXT_DAYS: нужно целое число дней, например 14' }).int().min(1).max(90).default(14),
   ),
+  /** Какие новые чаты анализировать: none — никакие, direct — только лички (по умолчанию), all — все. */
+  ANALYZE_NEW_CHATS: z.preprocess(
+    (v) => (v === '' || v === undefined ? undefined : String(v).toLowerCase()),
+    z.enum(['none', 'direct', 'all'], { error: 'ANALYZE_NEW_CHATS: none|direct|all' }).default('direct'),
+  ),
   /** Fallback auto-провайдера на эвристику при ошибке primary (созданное → needs_review). */
   ALLOW_HEURISTIC_FALLBACK: optBool(false),
   /** Время дневного дайджеста HH:MM в TIMEZONE (шаг 7). */
@@ -100,12 +111,23 @@ const envSchema = z.object({
     (v) => (v === '' || v === undefined ? undefined : Number(v)),
     z.number({ error: 'RETENTION_DAYS: нужно целое число дней, 0 = выключено' }).int().min(0).max(3650).default(0),
   ),
+  /** Обезличивание закрытых задач (title/description) старше N дней; 0 = выключено. */
+  RETENTION_TASKS_DAYS: z.preprocess(
+    (v) => (v === '' || v === undefined ? undefined : Number(v)),
+    z.number({ error: 'RETENTION_TASKS_DAYS: нужно целое число дней, 0 = выключено' }).int().min(0).max(3650).default(0),
+  ),
   /** Транскрибация голосовых (шаг 10). ВЫКЛЮЧЕНА по умолчанию: аудио уходит стороннему ASR. */
   TRANSCRIBE_VOICE: optBool(false),
   TRANSCRIBE_URL: optString('https://api.openai.com/v1'),
   TRANSCRIBE_MODEL: optString('whisper-1'),
   TRANSCRIBE_API_KEY: optString(''),
-  TRANSCRIBE_TMP_DIR: optString('./data/tmp'),
+  /** минут ожидания транскрипта перед анализом голосового (по умолчанию 5) */
+  VOICE_GRACE_MIN: z.preprocess(
+    (v) => (v === '' || v === undefined ? undefined : Number(v)),
+    z.number({ error: 'VOICE_GRACE_MIN: нужно целое число минут, например 5' }).int().min(0).max(1440).default(5),
+  ),
+  /** язык транскрибации; auto = параметр не передаётся */
+  TRANSCRIBE_LANGUAGE: optString('auto'),
   AI_TEMPERATURE: z.preprocess(
     (v) => (v === '' || v === undefined ? undefined : Number(v)),
     z.number({ error: 'AI_TEMPERATURE: нужно число 0..2' }).min(0).max(2).default(0),
@@ -140,6 +162,9 @@ export const env = {
   webHost: raw.WEB_HOST,
   webPort: raw.WEB_PORT,
   webPassword: raw.WEB_PASSWORD,
+  allowNoAuth: raw.ALLOW_NO_AUTH,
+  trustProxy: raw.TRUST_PROXY,
+  allowedHosts: raw.ALLOWED_HOSTS === '' ? [] : raw.ALLOWED_HOSTS.split(',').map((h) => h.trim()).filter(Boolean),
   timezone: raw.TIMEZONE,
   ownerJid: raw.OWNER_JID,
   aiProvider: raw.AI_PROVIDER,
@@ -151,16 +176,19 @@ export const env = {
   qrTerminal: raw.QR_TERMINAL,
   aiContextLimit: raw.AI_CONTEXT_LIMIT,
   aiContextDays: raw.AI_CONTEXT_DAYS,
+  analyzeNewChats: raw.ANALYZE_NEW_CHATS,
   allowHeuristicFallback: raw.ALLOW_HEURISTIC_FALLBACK,
   digestTime: raw.DIGEST_TIME,
   backupKeepN: raw.BACKUP_KEEP_N,
   backupDir: raw.BACKUP_DIR,
   retentionDays: raw.RETENTION_DAYS,
+  retentionTasksDays: raw.RETENTION_TASKS_DAYS,
   transcribeVoice: raw.TRANSCRIBE_VOICE,
   transcribeUrl: raw.TRANSCRIBE_URL,
   transcribeModel: raw.TRANSCRIBE_MODEL,
   transcribeApiKey: raw.TRANSCRIBE_API_KEY,
-  transcribeTmpDir: raw.TRANSCRIBE_TMP_DIR,
+  voiceGraceMin: raw.VOICE_GRACE_MIN,
+  transcribeLanguage: raw.TRANSCRIBE_LANGUAGE,
   aiTemperature: raw.AI_TEMPERATURE,
   openrouterApiKey: raw.OPENROUTER_API_KEY,
   openrouterModel: raw.OPENROUTER_MODEL,

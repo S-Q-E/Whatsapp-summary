@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify';
-import { and, asc, desc, eq, gte, inArray, lt, type SQL } from 'drizzle-orm';
+import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, lte, type SQL } from 'drizzle-orm';
 import { z } from 'zod';
 import type { Db } from '../../database/db.js';
 import { chats, messages, tasks } from '../../database/schema.js';
@@ -87,6 +87,7 @@ const MsgShape = z.object({
   direction: z.string(),
   senderName: z.string().nullable(),
   text: z.string().nullable(),
+  transcript: z.string().nullable(),
   messageType: z.string(),
   timestamp: z.number(),
   isSource: z.boolean(),
@@ -215,24 +216,50 @@ export async function dashboardRoutes(app: FastifyInstance, db: Db): Promise<voi
       .where(eq(tasks.id, id));
     const task = found[0];
     if (!task) return reply.code(404).send({ error: 'задача не найдена' });
-    const all = await db
-      .select({
-        id: messages.id,
-        direction: messages.direction,
-        senderName: messages.senderName,
-        text: messages.text,
-        messageType: messages.messageType,
-        timestamp: messages.timestamp,
-      })
-      .from(messages)
-      .where(and(eq(messages.chatId, task.chatId)))
-      .orderBy(asc(messages.id));
-    let window: typeof all = all;
+    // Окно ±5 считается в БД: 5 до (включая источник) + 5 после.
+    // Удалённые не показываем.
+    const selectBase = {
+      id: messages.id,
+      direction: messages.direction,
+      senderName: messages.senderName,
+      text: messages.text,
+      transcript: messages.transcript,
+      messageType: messages.messageType,
+      timestamp: messages.timestamp,
+    };
+    type CtxRow = {
+      id: number;
+      direction: string;
+      senderName: string | null;
+      text: string | null;
+      transcript: string | null;
+      messageType: string;
+      timestamp: number;
+    };
+    const notDeleted = isNull(messages.deletedAt);
+    let window: CtxRow[];
     if (task.sourceMessageId !== null) {
-      const idx = all.findIndex((m) => m.id === task.sourceMessageId);
-      if (idx !== -1) window = all.slice(Math.max(0, idx - 5), idx + 6);
+      const before: CtxRow[] = await db
+        .select(selectBase)
+        .from(messages)
+        .where(and(eq(messages.chatId, task.chatId), lte(messages.id, task.sourceMessageId), notDeleted))
+        .orderBy(desc(messages.id))
+        .limit(6);
+      const after: CtxRow[] = await db
+        .select(selectBase)
+        .from(messages)
+        .where(and(eq(messages.chatId, task.chatId), gt(messages.id, task.sourceMessageId), notDeleted))
+        .orderBy(asc(messages.id))
+        .limit(5);
+      window = [...before.reverse(), ...after];
     } else {
-      window = all.slice(-11);
+      const last: CtxRow[] = await db
+        .select(selectBase)
+        .from(messages)
+        .where(and(eq(messages.chatId, task.chatId), notDeleted))
+        .orderBy(desc(messages.id))
+        .limit(11);
+      window = last.reverse();
     }
     const list = window.map((m) => ({
       ...m,

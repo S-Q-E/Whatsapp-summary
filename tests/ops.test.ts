@@ -10,7 +10,7 @@ import { openTestDb } from './db.js';
 import { runBackup, rotateBackups } from '../src/ops/backup.js';
 import { runRetention } from '../src/ops/retention.js';
 import { loadPendingBundles } from '../src/ai/taskService.js';
-import { storeMessage } from '../src/whatsapp/store.js';
+import { setChatIgnored, storeMessage } from '../src/whatsapp/store.js';
 
 const silent = pino({ level: 'silent' });
 type TestDb = ReturnType<typeof openTestDb>['db'];
@@ -60,7 +60,7 @@ describe('шаг 9: ретеншн текстов', () => {
 });
 
 describe('шаг 9: бэкапы sqlite', () => {
-  it('backup — валидная копия; ротация держит последние N', async () => {
+  it('backup — валидная копия; повтор в те же сутки пропускается; ротация держит N', async () => {
     const { db, close } = openTestDb();
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'waback-'));
     try {
@@ -70,20 +70,21 @@ describe('шаг 9: бэкапы sqlite', () => {
       const fileDb = new Database(file);
       fileDb.exec(`CREATE TABLE chats AS SELECT * FROM (SELECT 1 AS id, 'a' AS jid, 'N' AS display_name, 0 AS is_group, 1 AS created_at)`);
       fileDb.close();
-      const p1 = await runBackup(file, dir, 2, silent);
-      assert.ok(fs.existsSync(p1));
+      const p1 = await runBackup(file, dir, 2, silent, { timezone: 'Asia/Almaty' });
+      assert.ok(p1 && fs.existsSync(p1));
       assert.ok(!p1.includes('auth'), 'auth не копируется — только sqlite файл');
       const check = new Database(p1, { readonly: true });
       assert.equal((check.prepare(`SELECT COUNT(*) AS n FROM chats`).get() as { n: number }).n, 1);
       check.close();
-      await new Promise((r) => setTimeout(r, 1100));
-      const p2 = await runBackup(file, dir, 2, silent);
-      assert.notEqual(p1, p2);
-      await new Promise((r) => setTimeout(r, 1100));
-      await runBackup(file, dir, 2, silent);
+      // тот же день — пропуск, нового файла нет
+      const p2 = await runBackup(file, dir, 2, silent, { timezone: 'Asia/Almaty' });
+      assert.equal(p2, null);
+      // ротация на файлах прошлых дней
+      fs.writeFileSync(path.join(dir, 'whatsapp-2020-01-01T00-00-00.db'), 'x');
+      fs.writeFileSync(path.join(dir, 'whatsapp-2020-01-02T00-00-00.db'), 'x');
+      fs.writeFileSync(path.join(dir, 'whatsapp-2020-01-03T00-00-00.db'), 'x');
       const kept = rotateBackups(dir, 2, silent);
       assert.equal(kept, 2);
-      assert.equal(fs.readdirSync(dir).filter((f) => f.endsWith('.db')).length, 3); // src.db + 2 бэкапа
       close();
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -101,7 +102,9 @@ describe('шаг 9: игнорируемые чаты не идут в AI', () =
         db.run(sql`INSERT INTO messages (whatsapp_message_id, chat_jid, chat_id, direction, message_type, text, timestamp, is_from_me, created_at)
           VALUES (${`w-${jid}`}, ${jid}, ${chatId}, 'incoming', 'text', 'секретный текст', ${now}, 0, ${now})`);
       }
-      db.run(sql`INSERT INTO chat_settings (chat_jid, ignored, updated_at) VALUES ('b@s.whatsapp.net', 1, ${now})`);
+      db.run(sql`INSERT INTO chats (jid, display_name, is_group, created_at) VALUES ('b@s.whatsapp.net', 'B', 0, 1)
+        ON CONFLICT(jid) DO NOTHING`);
+      setChatIgnored(db, db.get<{ id: number }>(sql`SELECT id FROM chats WHERE jid = 'b@s.whatsapp.net'`)!.id, 1);
       const bundles = loadPendingBundles(db, { now });
       assert.deepEqual(bundles.map((b) => b.chatJid), ['a@s.whatsapp.net']);
     } finally {

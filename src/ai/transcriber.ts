@@ -42,7 +42,7 @@ export class OpenAICompatibleTranscriber implements Transcriber {
     this.model = opts.model ?? env.transcribeModel;
     this.apiKey = opts.apiKey ?? env.transcribeApiKey;
     this.timeoutMs = opts.timeoutMs ?? env.aiTimeoutMs;
-    this.language = opts.language ?? 'ru';
+    this.language = opts.language ?? env.transcribeLanguage;
   }
 
   async transcribe(audio: Buffer, mime: string): Promise<string> {
@@ -53,7 +53,8 @@ export class OpenAICompatibleTranscriber implements Transcriber {
     const form = new FormData();
     form.append('file', new Blob([audio], { type: mime }), 'voice.ogg');
     form.append('model', this.model);
-    form.append('language', this.language);
+    // auto = язык не передаём, пусть решает сервер
+    if (this.language !== 'auto') form.append('language', this.language);
     form.append('response_format', 'json');
     let res: Response;
     try {

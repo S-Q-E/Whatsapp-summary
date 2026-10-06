@@ -1,6 +1,3 @@
-import { randomUUID } from 'node:crypto';
-import fs from 'node:fs';
-import path from 'node:path';
 import { sql } from 'drizzle-orm';
 import type { Logger } from 'pino';
 import type { WAMessage } from '@whiskeysockets/baileys';
@@ -13,7 +10,6 @@ export type VoiceDeps = {
   transcriber: Transcriber;
   /** скачивание аудио из WhatsApp (в проде — Baileys downloadMediaMessage) */
   downloadAudio: (waMsg: WAMessage) => Promise<Buffer>;
-  tmpDir: string;
   enabled: boolean;
 };
 
@@ -21,9 +17,11 @@ export type VoiceResult = 'transcribed' | 'skipped' | 'failed';
 
 function isChatIgnored(db: Db, chatJid: string): boolean {
   try {
-    const row = db.get<{ ignored: number }>(
-      sql`SELECT ignored FROM chat_settings WHERE chat_jid = ${chatJid}`,
-    );
+    const row = db.get<{ ignored: number }>(sql`
+      SELECT s.ignored FROM chat_settings s
+      JOIN chats c ON c.id = s.chat_id
+      WHERE c.jid = ${chatJid}
+    `);
     return (row?.ignored ?? 0) === 1;
   } catch {
     return false;
@@ -32,9 +30,10 @@ function isChatIgnored(db: Db, chatJid: string): boolean {
 
 /**
  * Транскрибация одного голосового (шаг 10): только realtime audio/voice
- * из разрешённых чатов. Аудиофайл пишется во временную папку и удаляется
- * сразу после распознавания (успех и ошибка — в finally). В БД остаётся
- * только текст. Ошибки наружу не пробрасываются — только warn с id.
+ * из разрешённых чатов. Аудио никуда не пишется — транскриберу уходит
+ * Buffer из памяти. В БД остаётся только текст; заодно сбрасываем
+ * processed_at, чтобы сообщение с новым транскриптом попало в анализ.
+ * Ошибки наружу не пробрасываются — только warn с id.
  */
 export async function processVoiceMessage(
   deps: VoiceDeps,
@@ -48,20 +47,16 @@ export async function processVoiceMessage(
     log.info({ chat: parsed.chatJid }, 'voice in ignored chat, transcription skipped');
     return 'skipped';
   }
-  let tmpFile: string | null = null;
   try {
     const audio = await deps.downloadAudio(waMsg);
-    fs.mkdirSync(deps.tmpDir, { recursive: true });
-    tmpFile = path.join(deps.tmpDir, `${randomUUID()}.ogg`);
-    fs.writeFileSync(tmpFile, audio);
     const text = await deps.transcriber.transcribe(audio, 'audio/ogg');
     db.run(sql`
-      UPDATE messages SET transcript = ${text}
+      UPDATE messages SET transcript = ${text}, processed_at = NULL
       WHERE chat_jid = ${parsed.chatJid} AND whatsapp_message_id = ${parsed.whatsappMessageId}
     `);
     log.info(
       { chat: parsed.chatJid, msgId: parsed.whatsappMessageId, chars: text.length },
-      'voice transcribed (audio file removed)',
+      'voice transcribed',
     );
     return 'transcribed';
   } catch (err) {
@@ -70,13 +65,5 @@ export async function processVoiceMessage(
       'voice transcription failed',
     );
     return 'failed';
-  } finally {
-    if (tmpFile) {
-      try {
-        fs.unlinkSync(tmpFile);
-      } catch {
-        // ignore cleanup errors
-      }
-    }
   }
 }

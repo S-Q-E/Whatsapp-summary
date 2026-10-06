@@ -18,6 +18,8 @@ export type ConversationMessage = {
   /** ms epoch, для понимания «сегодня/завтра» */
   timestamp: number;
   whatsappMessageId: string;
+  /** id задачи, уже созданной из этого сообщения (пометка в контексте) */
+  existingTaskId?: number | null;
 };
 
 /** Уже известные открытые задачи чата — AI закрывает их по id. */
@@ -27,12 +29,23 @@ export type ExistingTaskSummary = {
   status: TaskStatus;
 };
 
+/** Недавно закрытая задача — показывается отдельным блоком, не воскрешать. */
+export type ClosedTaskSummary = {
+  id: number;
+  title: string;
+  status: TaskStatus;
+  /** внутренний messages.id источника (может отсутствовать) */
+  sourceMessageId: number | null;
+};
+
 export type ConversationInput = {
   chatJid: string;
   contactName: string | null;
   /** отсортированы по времени, старые -> новые */
   messages: ConversationMessage[];
   existingTasks: ExistingTaskSummary[];
+  /** закрытые за окно контекста — отдельным блоком «не создавай заново» */
+  recentlyClosed?: ClosedTaskSummary[];
   /** ms epoch момента анализа — точка отсчёта для «сегодня/завтра/вечером» */
   analyzedAt: number;
 };
