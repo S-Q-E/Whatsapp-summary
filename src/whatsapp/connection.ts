@@ -27,14 +27,31 @@ export type WhatsappClient = {
   stop: (reason?: string) => void;
 };
 
+/**
+ * Hooks для внешних потребителей (WEB-сервер, SSE).
+ * По умолчанию всё как раньше: QR в терминал, логи в pino.
+ */
+export type ClientHooks = {
+  onQr?: (qr: string) => void;
+  onConnected?: (info: { phone: string | null }) => void;
+  onDisconnected?: (info: { code?: number; loggedOut: boolean }) => void;
+};
+
 const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 /**
  * READ-ONLY client: connects, persists auth, stores messages.
  * Never calls sendMessage / any write API against WhatsApp.
  */
-export async function startWhatsAppClient(opts: { db: Db; log: Logger }): Promise<WhatsappClient> {
-  const { db, log } = opts;
+export async function startWhatsAppClient(opts: {
+  db: Db;
+  log: Logger;
+  hooks?: ClientHooks;
+  /** печатать QR в терминал (default true — для standalone-режима src/index.ts) */
+  qrToTerminal?: boolean;
+}): Promise<WhatsappClient> {
+  const { db, log, hooks } = opts;
+  const qrToTerminal = opts.qrToTerminal ?? true;
 
   fs.mkdirSync(env.authDir, { recursive: true });
   try {
@@ -100,7 +117,8 @@ export async function startWhatsAppClient(opts: { db: Db; log: Logger }): Promis
 
       if (qr) {
         log.warn('QR received — scan with WhatsApp: Settings > Linked devices > Link a device');
-        qrcode.generate(qr, { small: true });
+        if (qrToTerminal) qrcode.generate(qr, { small: true });
+        hooks?.onQr?.(qr);
       }
 
       if (connection === 'open') {
@@ -109,11 +127,13 @@ export async function startWhatsAppClient(opts: { db: Db; log: Logger }): Promis
           { me: s.user?.id, lid: (s.user as { lid?: string } | undefined)?.lid },
           'whatsapp connected',
         );
+        hooks?.onConnected?.({ phone: s.user?.id ?? null });
       }
 
       if (connection === 'close') {
         const code = (lastDisconnect?.error as Boom | undefined)?.output?.statusCode;
         const loggedOut = code === DisconnectReason.loggedOut;
+        hooks?.onDisconnected?.({ code, loggedOut });
 
         if (loggedOut) {
           // Session revoked on the phone side (device removed) or explicit logout.

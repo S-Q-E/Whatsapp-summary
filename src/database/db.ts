@@ -62,6 +62,11 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 CREATE INDEX IF NOT EXISTS tasks_chat_idx ON tasks (chat_jid);
 CREATE INDEX IF NOT EXISTS tasks_status_idx ON tasks (status);
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
 `;
 
 export function openDatabase(log: Logger): Db {

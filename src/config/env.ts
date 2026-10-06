@@ -27,6 +27,9 @@ export const env = {
   markOnlineOnConnect: bool('MARK_ONLINE_ON_CONNECT', false),
   syncFullHistory: bool('SYNC_FULL_HISTORY', false),
   sqlitePath: str('SQLITE_PATH', './data/whatsapp.db'),
+  // --- HTTP server (Phase 1: QR + status API) ---
+  serverHost: str('SERVER_HOST', '127.0.0.1'),
+  serverPort: num('SERVER_PORT', 3000),
   // --- AI analysis ---
   /** auto = cloud (OpenRouter, если задан ключ) или Ollama, иначе эвристика. Также: openrouter | ollama | heuristic | mock */
   aiProvider: str('AI_PROVIDER', 'auto'),

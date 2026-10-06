@@ -156,10 +156,17 @@ src/
   database/
     schema.ts              # drizzle-схема contacts/messages/tasks + индексы
     db.ts                  # better-sqlite3 (WAL) + идемпотентный bootstrap DDL
-  whatsapp/                # ingestion MVP — НЕ МЕНЯТЬ без необходимости
-    connection.ts          # Baileys 7.x: auth, QR, reconnect, logout, подписки
+  whatsapp/                # ingestion — логика НЕ менялась, добавлены только hooks
+    connection.ts          # Baileys 7.x: auth, QR, reconnect, logout, подписки (+ClientHooks)
+    manager.ts             # владелец соединения в серверном режиме, жизненный цикл
+    qr-manager.ts          # последний QR для WEB (сырая строка, рендерит фронт)
+    status-store.ts        # connecting|qr_pending|connected|disconnected|logged_out
     messageParser.ts       # WAMessage -> плоская структура (текст/группы/медиа-капшены)
     store.ts               # upsert contacts + idempotent INSERT messages
+  server/                  # PHASE 1: Fastify (фронтенд — Phase 2)
+    index.ts               # boot: DB + WhatsAppManager + routes, graceful shutdown
+    routes/
+      whatsapp.ts          # status/qr/events(SSE)/disconnect/connect, Zod-контракты
   ai/                      # этап 2: извлечение обязательств врача
     types.ts               # AIProvider, ConversationInput/Output, ExtractedTask
     prompts.ts             # PROMPT_VERSION + сборка промпта (JSON-контракт)
@@ -259,6 +266,32 @@ npm run digest -- --date=2026-10-05   # отчёт за конкретную д�
   plain text + эмодзи без markdown-разметки: одинаково уйдёт и в Telegram,
   и в WhatsApp. Новый канал доставки = новый класс рендера, builder и CLI не меняются.
 
+## PHASE 1: Backend + QR API (выполнено, проверено вживую)
+
+HTTP-сервер владеет Baileys-соединением; ingestion продолжается внутри
+`connection.ts` без изменений логики.
+
+```bash
+npm run dev:server   # http://127.0.0.1:3000 (SERVER_HOST/SERVER_PORT в .env)
+```
+
+| Метод | Путь | Назначение |
+|---|---|---|
+| GET | `/api/health` | живость |
+| GET | `/api/whatsapp/status` | `{status, phone, connectedAt, lastSeen, hasSession, qrAvailable}` |
+| GET | `/api/whatsapp/qr` | сырая QR-строка (рендер — `qrcode.react` в Phase 2) |
+| GET | `/api/whatsapp/events` | SSE: `snapshot` сразу, дальше `qr`/`status`, heartbeat `: ping` |
+| POST | `/api/whatsapp/disconnect` | закрыть соединение, сессию сохранить |
+| POST | `/api/whatsapp/connect` | переподключить (расширение спеки — иначе UI нечем встать после disconnect) |
+
+Статусы: `connecting | qr_pending | connected | disconnected | logged_out`.
+При `logged_out` (401) локальная auth-сессия стирается автоматически,
+UI возвращается в «Scan QR». Рестарт сервера — без повторного QR.
+Auth credentials в API не отдаются никогда. Все ответы валидируются Zod.
+Полный разнос `whatsapp/` на `client/auth/message-handler/sender` —
+в фазах 3 и 8 вместе с owner-логикой и отправкой; дублировать рабочий код
+ради структуры сейчас не стали.
+
 ## Что дальше (не в этом этапе)
 
-Доставка дайджеста в Telegram, веб-интерфейс, Docker.
+Phase 2: React dashboard + QR-страница. Доставка дайджеста в Telegram, Docker.
