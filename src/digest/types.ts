@@ -27,6 +27,8 @@ export type DigestStats = {
   confidenceHigh: number;
   confidenceMedium: number;
   confidenceLow: number;
+  /** голосовых без processed_at (ещё не разобраны) — транскрибации пока нет */
+  unheardVoice: number;
 };
 
 export type DailyDigest = {

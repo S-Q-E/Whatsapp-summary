@@ -56,6 +56,11 @@ export class WhatsAppManager {
     return this.qrStore.snapshot();
   }
 
+  /** Сырая QR-строка для PNG-рендера (шаг 5). */
+  qrString(): string | null {
+    return this.qrStore.snapshot().qr;
+  }
+
   hasSession(): boolean {
     try {
       const files = fs.readdirSync(this.authDir);
@@ -122,6 +127,25 @@ export class WhatsAppManager {
     }
     this.client = null;
     this.statusStore.onManualDisconnect();
+    this.emitStatus();
+    return this.snapshot();
+  }
+
+  /**
+   * Полный logout (шаг 5, POST /api/whatsapp/logout): закрыть соединение
+   * и стереть локальную auth-сессию. Следующий connect покажет новый QR.
+   */
+  async logout(): Promise<StatusSnapshot> {
+    this.manualStop = true;
+    this.qrStore.clear();
+    try {
+      this.client?.stop('manual logout via API');
+    } catch {
+      // ignore errors during manual logout
+    }
+    this.client = null;
+    this.wipeAuth();
+    this.statusStore.onLoggedOut();
     this.emitStatus();
     return this.snapshot();
   }

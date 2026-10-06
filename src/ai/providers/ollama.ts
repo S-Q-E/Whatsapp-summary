@@ -1,7 +1,7 @@
 import { env } from '../../config/env.js';
 import { buildPrompt, PROMPT_VERSION } from '../prompts.js';
 import type { AIProvider, AnalyzeOutput, ConversationInput } from '../types.js';
-import { parseModelOutput } from '../validate.js';
+import { parseModelActions } from '../validate.js';
 
 type OllamaChatResponse = {
   message?: { content?: string };
@@ -27,7 +27,7 @@ export class OllamaProvider implements AIProvider {
   }
 
   async analyzeConversation(input: ConversationInput): Promise<AnalyzeOutput> {
-    const { system, user } = buildPrompt(input);
+    const { system, user } = buildPrompt(input, env.timezone);
     let res: Response;
     try {
       res = await fetch(`${this.baseUrl.replace(/\/$/, '')}/api/chat`, {
@@ -58,6 +58,7 @@ export class OllamaProvider implements AIProvider {
     if (data.error) throw new Error(`Ollama error: ${data.error}`);
     const content = data.message?.content ?? '';
     if (!content) throw new Error('Ollama returned empty content');
-    return parseModelOutput(content);
+    const { actions, dropped } = parseModelActions(content, input);
+    return { tasks: actions, dropped };
   }
 }

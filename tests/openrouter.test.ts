@@ -8,18 +8,22 @@ const INPUT: ConversationInput = {
   contactName: 'Пациент',
   messages: [
     {
+      id: 11,
       direction: 'incoming',
       senderName: 'Пациент',
       text: 'Посмотрите мои анализы?',
       messageType: 'text',
+      durationSec: null,
       timestamp: 1_700_000_000_000,
       whatsappMessageId: 'm1',
     },
     {
+      id: 12,
       direction: 'outgoing',
       senderName: null,
       text: 'Посмотрю вечером и напишу.',
       messageType: 'text',
+      durationSec: null,
       timestamp: 1_700_000_100_000,
       whatsappMessageId: 'm2',
     },
@@ -28,7 +32,7 @@ const INPUT: ConversationInput = {
   analyzedAt: 1_700_000_200_000,
 };
 
-const tasksJson = (tasks: unknown): string => JSON.stringify({ tasks });
+const tasksJson = (actions: unknown): string => JSON.stringify({ actions });
 
 type TestContext = { after: (fn: () => void) => void };
 
@@ -54,7 +58,7 @@ const jsonResponse = (obj: unknown, status = 200): Response =>
 describe('OpenRouterProvider', () => {
   it('строит корректный запрос: URL, auth, заголовки, json-режим', async (t) => {
     const { calls } = stubFetch(t, () =>
-      jsonResponse({ choices: [{ message: { content: '{"tasks": []}' } }] }),
+      jsonResponse({ choices: [{ message: { content: '{"actions": []}' } }] }),
     );
     const p = new OpenRouterProvider({
       baseUrl: 'https://openrouter.ai/api/v1',
@@ -64,7 +68,7 @@ describe('OpenRouterProvider', () => {
       siteUrl: 'https://example.com',
     });
     const out = await p.analyzeConversation(INPUT);
-    assert.deepEqual(out, { tasks: [] });
+    assert.deepEqual(out, { tasks: [], dropped: [] });
     assert.equal(calls.length, 1);
     assert.equal(calls[0]!.url, 'https://openrouter.ai/api/v1/chat/completions');
     const headers = calls[0]!.init.headers as Record<string, string>;
@@ -83,7 +87,7 @@ describe('OpenRouterProvider', () => {
   });
 
   it('не шлёт опциональные заголовки, если они пустые', async (t) => {
-    stubFetch(t, () => jsonResponse({ choices: [{ message: { content: '{"tasks": []}' } }] }));
+    stubFetch(t, () => jsonResponse({ choices: [{ message: { content: '{"actions": []}' } }] }));
     const p = new OpenRouterProvider({ apiKey: 'sk-test-key', appTitle: '', siteUrl: '' });
     await p.analyzeConversation(INPUT);
   });
@@ -96,11 +100,13 @@ describe('OpenRouterProvider', () => {
             message: {
               content: tasksJson([
                 {
-                  action: 'create',
+                  type: 'create',
+                  taskId: null,
                   title: 'Посмотреть анализы',
-                  status: 'pending',
+                  status: 'open',
                   confidence: 0.9,
-                  deadlineText: 'сегодня вечером',
+                  dueText: 'сегодня вечером',
+                  evidenceMessageId: 'm12',
                 },
               ]),
             },
@@ -112,7 +118,8 @@ describe('OpenRouterProvider', () => {
     const out = await p.analyzeConversation(INPUT);
     assert.equal(out.tasks.length, 1);
     assert.equal(out.tasks[0]!.title, 'Посмотреть анализы');
-    assert.equal(out.tasks[0]!.deadlineText, 'сегодня вечером');
+    assert.equal(out.tasks[0]!.dueText, 'сегодня вечером');
+    assert.equal(out.tasks[0]!.messageId, 12);
     assert.equal(p.name, 'openrouter');
     assert.equal(p.model, 'openai/gpt-4o-mini');
   });

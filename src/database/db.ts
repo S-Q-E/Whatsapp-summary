@@ -1,73 +1,124 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 import { drizzle, type BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
+import { migrate } from 'drizzle-orm/better-sqlite3/migrator';
 import type { Logger } from 'pino';
 import { env } from '../config/env.js';
 
 export type Db = BetterSQLite3Database<Record<string, never>>;
 
-let sqlite: Database.Database | null = null;
-let db: Db | null = null;
+/**
+ * Папка версионированных миграций (drizzle-kit generate).
+ * Путь от import.meta — работает и из src (tsx), и из dist (node).
+ */
+export const MIGRATIONS_DIR = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  '../../drizzle',
+);
+
+type Journal = { entries: Array<{ when: number; tag: string }> };
+
+function readJournal(migrationsFolder: string): Journal {
+  const raw = fs.readFileSync(path.join(migrationsFolder, 'meta', '_journal.json'), 'utf-8');
+  return JSON.parse(raw) as Journal;
+}
+
+function readMigrationStatements(migrationsFolder: string, tag: string): string[] {
+  const sql = fs.readFileSync(path.join(migrationsFolder, `${tag}.sql`), 'utf-8');
+  return sql.split('--> statement-breakpoint').map((s) => s.trim()).filter(Boolean);
+}
+
+function maxWhen(journal: Journal): number {
+  return Math.max(...journal.entries.map((e) => e.when));
+}
+
+function tableExists(sqlite: Database.Database, name: string): boolean {
+  const row = sqlite
+    .prepare(`SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ?`)
+    .get(name) as { ok: number } | undefined;
+  return row !== undefined;
+}
+
+function appliedCount(sqlite: Database.Database): number {
+  if (!tableExists(sqlite, '__drizzle_migrations')) return 0;
+  const row = sqlite.prepare(`SELECT COUNT(*) AS n FROM __drizzle_migrations`).get() as { n: number };
+  return row.n;
+}
+
+/** Ошибка «объект уже есть» — единственный терпимый исход replay. */
+function isAlreadyExists(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /already exists|duplicate column name/i.test(msg);
+}
 
 /**
- * DDL kept in code so the FIRST run works without a separate
- * `drizzle-kit migrate` step. drizzle-kit (drizzle.config.ts + ./drizzle)
- * is used for future versioned migrations; this is an idempotent bootstrap.
- * Exported for tests (in-memory DB setup).
+ * Baseline-стратегия для БД, созданных старым BOOTSTRAP_SQL:
+ * таблицы частично есть, журнала миграций нет.
+ * Проигрываем весь журнал толерантно: существующие объекты пропускаем
+ * (already exists), недостающие строим, данные мигрируют штатным путём
+ * (включая INSERT..SELECT и маппинг статусов). Затем помечаем журнал
+ * применённым. Любая другая ошибка — громко наружу.
+ * Свежие БД идут обычным путём через migrate().
  */
-export const BOOTSTRAP_SQL = `
-CREATE TABLE IF NOT EXISTS contacts (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  jid TEXT NOT NULL UNIQUE,
-  phone TEXT,
-  name TEXT,
-  push_name TEXT,
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS messages (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  whatsapp_message_id TEXT NOT NULL,
-  chat_jid TEXT NOT NULL,
-  sender_jid TEXT,
-  sender_name TEXT,
-  direction TEXT NOT NULL,
-  message_type TEXT NOT NULL,
-  text TEXT,
-  timestamp INTEGER NOT NULL,
-  is_from_me INTEGER NOT NULL DEFAULT 0,
-  created_at INTEGER NOT NULL
-);
-CREATE UNIQUE INDEX IF NOT EXISTS messages_wamid_chat_uidx
-  ON messages (whatsapp_message_id, chat_jid);
-CREATE INDEX IF NOT EXISTS messages_chat_idx ON messages (chat_jid);
-CREATE INDEX IF NOT EXISTS messages_timestamp_idx ON messages (timestamp);
-CREATE TABLE IF NOT EXISTS tasks (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  chat_jid TEXT NOT NULL,
-  contact_id INTEGER,
-  title TEXT NOT NULL,
-  description TEXT,
-  source_message_id TEXT,
-  deadline INTEGER,
-  deadline_text TEXT,
-  status TEXT NOT NULL DEFAULT 'pending',
-  confidence REAL,
-  model TEXT,
-  prompt_version TEXT,
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL,
-  completed_at INTEGER
-);
-CREATE INDEX IF NOT EXISTS tasks_chat_idx ON tasks (chat_jid);
-CREATE INDEX IF NOT EXISTS tasks_status_idx ON tasks (status);
-CREATE TABLE IF NOT EXISTS settings (
-  key TEXT PRIMARY KEY,
-  value TEXT NOT NULL,
-  updated_at INTEGER NOT NULL
-);
-`;
+function baselineLegacyDb(sqlite: Database.Database, migrationsFolder: string, log?: Logger): void {
+  if (!tableExists(sqlite, 'contacts')) return; // свежая БД — нечего бейзлайнить
+  if (appliedCount(sqlite) > 0) return; // уже под миграциями
+  const journal = readJournal(migrationsFolder);
+  if (journal.entries.length === 0) throw new Error('пустой журнал миграций');
+  let replayed = 0;
+  sqlite.exec('BEGIN');
+  try {
+    for (const entry of journal.entries) {
+      for (const stmt of readMigrationStatements(migrationsFolder, entry.tag)) {
+        try {
+          sqlite.exec(stmt);
+          replayed += 1;
+        } catch (err) {
+          if (isAlreadyExists(err)) continue;
+          throw err;
+        }
+      }
+    }
+    sqlite.exec(`
+      CREATE TABLE IF NOT EXISTS __drizzle_migrations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        hash TEXT NOT NULL,
+        created_at NUMERIC
+      );
+    `);
+    sqlite
+      .prepare(`INSERT INTO __drizzle_migrations (hash, created_at) VALUES (?, ?)`)
+      .run('baseline-legacy-bootstrap', maxWhen(journal));
+    sqlite.exec('COMMIT');
+  } catch (err) {
+    try {
+      sqlite.exec('ROLLBACK');
+    } catch {
+      // ignore rollback errors, исходная ошибка важнее
+    }
+    throw err;
+  }
+  log?.info({ replayed }, 'legacy DB detected: journal replayed tolerantly, data kept');
+}
+
+/**
+ * Применяет версионированные миграции. Идемпотентно: повторный прогон
+ * ничего не делает. Экспортирована для тестов (изолированные БД).
+ */
+export function runMigrations(
+  db: Db,
+  sqlite: Database.Database,
+  migrationsFolder: string,
+  log?: Logger,
+): void {
+  baselineLegacyDb(sqlite, migrationsFolder, log);
+  migrate(db, { migrationsFolder });
+}
+
+let sqlite: Database.Database | null = null;
+let db: Db | null = null;
 
 export function openDatabase(log: Logger): Db {
   if (db) return db;
@@ -76,8 +127,8 @@ export function openDatabase(log: Logger): Db {
   sqlite = new Database(file);
   sqlite.pragma('journal_mode = WAL');
   sqlite.pragma('foreign_keys = ON');
-  sqlite.exec(BOOTSTRAP_SQL);
   db = drizzle(sqlite);
+  runMigrations(db, sqlite, MIGRATIONS_DIR, log);
   log.info({ sqlitePath: file }, 'sqlite opened (WAL)');
   return db;
 }

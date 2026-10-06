@@ -28,20 +28,24 @@ export class HeuristicProvider implements AIProvider {
 
       const completion = matchCompletion(text);
       if (completion) {
+        // Закрытие — только по id из известных задач (свои названия детерминированы,
+        // поэтому точное совпадение надёжно). Нет известной — молчим, не выдумываем.
+        const known = input.existingTasks.find((t) => t.title === completion);
         const key = `done:${completion}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        tasks.push({
-          action: 'update',
-          matchTitle: completion,
-          title: completion,
-          description: `Врач сообщил о выполнении: «${truncate(m.text)}»`,
-          status: 'completed',
-          deadline: null,
-          deadlineText: null,
-          confidence: 0.65,
-          sourceMessageId: m.whatsappMessageId,
-        });
+        if (known && !seen.has(key)) {
+          seen.add(key);
+          tasks.push({
+            action: 'complete',
+            taskId: known.id,
+            title: completion,
+            description: `Врач сообщил о выполнении: «${truncate(m.text)}»`,
+            status: 'done',
+            dueAt: null,
+            dueText: null,
+            confidence: 0.65,
+            messageId: m.id,
+          });
+        }
         continue;
       }
 
@@ -52,14 +56,14 @@ export class HeuristicProvider implements AIProvider {
         seen.add(key);
         tasks.push({
           action: 'create',
-          matchTitle: null,
+          taskId: null,
           title: promise.title,
           description: `Обещание врача: «${truncate(m.text)}»`,
-          status: 'pending',
-          deadline: null,
-          deadlineText: extractDeadlineText(text),
+          status: 'open',
+          dueAt: null,
+          dueText: extractDeadlineText(text),
           confidence: 0.6,
-          sourceMessageId: m.whatsappMessageId,
+          messageId: m.id,
         });
       }
     }

@@ -4,7 +4,7 @@ import { HeuristicProvider } from './providers/heuristic.js';
 import { MockProvider } from './providers/mock.js';
 import { OllamaProvider } from './providers/ollama.js';
 import { OpenRouterProvider } from './providers/openrouter.js';
-import type { AIProvider } from './types.js';
+import type { AIProvider, AnalyzeOutput, ConversationInput } from './types.js';
 
 export type ProviderKind = 'auto' | 'openrouter' | 'ollama' | 'heuristic' | 'mock';
 
@@ -21,43 +21,49 @@ export function createProvider(kind?: string): AIProvider {
   if (k === 'auto') {
     // Облако в приоритете, если задан ключ: ноутбуку не тянуть модели локально.
     const primary = env.openrouterApiKey ? new OpenRouterProvider() : new OllamaProvider();
-    return new AutoProvider(primary, new HeuristicProvider());
+    return new AutoProvider(primary, new HeuristicProvider(), env.allowHeuristicFallback);
   }
   throw new Error(`Unknown AI provider "${k}" (expected auto|openrouter|ollama|heuristic|mock)`);
 }
 
 /**
- * auto: пробует облако/локальную модель; при недоступности — честный fallback
- * на эвристику с warning в лог. Задачи всё равно помечены своим model,
- * подмены LLM незаметно не происходит.
+ * auto: каждый вызов сначала пробует primary (без залипания:
+ * временный сбой не переключает навсегда). Fallback на эвристику
+ * ВЫКЛЮЧЕН по умолчанию (ALLOW_HEURISTIC_FALLBACK=false) — ошибка primary
+ * пробрасывается наружу, сообщения остаются необработанными.
+ * Если fallback включён: всё созданное эвристикой помечается needs_review,
+ * чтобы грубое правило никогда не выглядело уверенным решением LLM.
  */
-class AutoProvider implements AIProvider {
+export class AutoProvider implements AIProvider {
   readonly name = 'auto';
   readonly model: string;
   readonly promptVersion: string;
-  private used: AIProvider | null = null;
 
   constructor(
     private readonly primary: AIProvider,
     private readonly fallback: AIProvider,
+    private readonly allowFallback: boolean = false,
   ) {
     this.model = `${primary.model}+${fallback.model}`;
     this.promptVersion = primary.promptVersion;
   }
 
-  async analyzeConversation(input: Parameters<AIProvider['analyzeConversation']>[0]) {
-    if (this.used) return this.used.analyzeConversation(input);
+  async analyzeConversation(input: ConversationInput): Promise<AnalyzeOutput> {
     try {
-      const out = await this.primary.analyzeConversation(input);
-      this.used = this.primary;
-      return out;
+      return await this.primary.analyzeConversation(input);
     } catch (err) {
+      if (!this.allowFallback) throw err;
       logger.warn(
         { err: (err as Error).message },
-        'primary AI provider failed, falling back to local heuristic (results will be marked as heuristic)',
+        'primary AI provider failed, heuristic fallback (all created tasks marked needs_review)',
       );
-      this.used = this.fallback;
-      return this.fallback.analyzeConversation(input);
+      const out = await this.fallback.analyzeConversation(input);
+      return {
+        tasks: out.tasks.map((t) =>
+          t.action === 'create' ? { ...t, status: 'needs_review' as const } : t,
+        ),
+        dropped: out.dropped,
+      };
     }
   }
 }

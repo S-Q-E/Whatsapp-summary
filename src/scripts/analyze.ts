@@ -1,16 +1,17 @@
 import { logger } from '../config/logger.js';
 import { closeDatabase, openDatabase } from '../database/db.js';
-import { analyzeChat, loadDayBundles } from '../ai/taskService.js';
+import { analyzeChat, loadPendingBundles } from '../ai/taskService.js';
 import { createProvider } from '../ai/providerFactory.js';
+import { parseDayArg } from '../digest/date.js';
 
 /**
  * npm run analyze [--provider=auto|openrouter|ollama|heuristic|mock] [--date=YYYY-MM-DD] [--chat=<подстрока-jid>]
  *
- * 1. берёт сообщения за день (по умолчанию сегодня, локальный день);
- * 2. группирует по chat_jid;
- * 3. каждый чат отдаёт AI целиком как контекст;
- * 4. создаёт/обновляет tasks (идемпотентно);
- * 5. печатает найденное в терминал.
+ * Инкрементально (шаг 3): разбираются только чаты с сообщениями
+ * processed_at IS NULL. Без --date — все необработанные; с --date —
+ * только этот день. После УСПЕШНОГО анализа сообщения помечаются
+ * processed_at; при ошибке провайдера остаются и попадут в следующий прогон.
+ * Повторный прогон дублей не создаёт (UNIQUE по источнику).
  *
  * READ-ONLY относительно WhatsApp: сокет здесь вообще не открывается,
  * работа идёт только с локальным SQLite. Ничего никому не отправляется.
@@ -23,27 +24,30 @@ async function main(): Promise<void> {
     }),
   );
 
-  const dateStr = (args['date'] as string | undefined) ?? 'today';
-  const day = dateStr === 'today' ? new Date() : new Date(`${dateStr}T12:00:00`);
-  if (Number.isNaN(day.getTime())) {
-    console.error('Bad --date, expected YYYY-MM-DD or "today"');
-    process.exit(1);
+  let day: Date | undefined;
+  const dateStr = args['date'] as string | undefined;
+  if (dateStr !== undefined) {
+    try {
+      day = parseDayArg(dateStr);
+    } catch (err) {
+      console.error((err as Error).message);
+      process.exit(1);
+    }
   }
 
   const provider = createProvider(args['provider'] as string | undefined);
   const chatFilter = args['chat'] as string | undefined;
   logger.info(
-    { provider: provider.name, model: provider.model, promptVersion: provider.promptVersion, date: dateStr },
+    { provider: provider.name, model: provider.model, promptVersion: provider.promptVersion, date: dateStr ?? 'pending' },
     'starting analysis',
   );
 
   const db = openDatabase(logger);
   const analyzedAt = Date.now();
   try {
-    const all = loadDayBundles(db, day);
-    const bundles = chatFilter ? all.filter((b) => b.chatJid.includes(chatFilter)) : all;
+    const bundles = loadPendingBundles(db, { day, chatFilter });
     if (bundles.length === 0) {
-      console.log('No chats with text messages for this day. Nothing to analyze.');
+      console.log('No unprocessed chats. Nothing to analyze.');
       console.log('Tip: run `npm run seed:demo` to load synthetic demo conversations, then re-run.');
       return;
     }
@@ -62,15 +66,15 @@ async function main(): Promise<void> {
       totalUpdated += result.updated.length;
 
       const who = b.contactName ?? b.chatJid;
-      console.log(`\n=== ${who} [${b.chatJid}] — сообщений: ${b.messages.length} ===`);
+      console.log(`\n=== ${who} [${b.chatJid}] — в контексте: ${b.messages.length}, новых: ${b.newMessageIds.length} ===`);
       if (result.created.length === 0 && result.updated.length === 0) {
-        console.log('  (задач не найдено — благодарности/вопросы задачами не считаются)');
+        console.log(`  (новых задач нет${result.skipped > 0 ? `, пропущено ссылок: ${result.skipped}` : ' — благодарности/вопросы задачами не считаются'})`);
       }
       for (const t of [...result.created, ...result.updated]) {
         const isNew = result.created.includes(t);
         console.log(
           `  ${isNew ? '[NEW]' : '[UPD]'} #${t.id} ${t.title} | status=${t.status} ` +
-            `| conf=${t.confidence} | deadline=${t.deadlineText ?? (t.deadline ? new Date(t.deadline).toISOString() : '—')} ` +
+            `| conf=${t.confidence} | deadline=${t.dueText ?? (t.dueAt ? new Date(t.dueAt).toISOString() : '—')} ` +
             `| model=${t.model} | prompt=${t.promptVersion}`,
         );
         if (t.description) console.log(`        ${t.description}`);

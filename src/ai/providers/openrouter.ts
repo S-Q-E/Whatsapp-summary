@@ -1,7 +1,7 @@
 import { env } from '../../config/env.js';
 import { buildPrompt, PROMPT_VERSION } from '../prompts.js';
 import type { AIProvider, AnalyzeOutput, ConversationInput } from '../types.js';
-import { parseModelOutput } from '../validate.js';
+import { parseModelActions } from '../validate.js';
 
 export type OpenRouterOptions = {
   baseUrl?: string;
@@ -54,7 +54,7 @@ export class OpenRouterProvider implements AIProvider {
         'OPENROUTER_API_KEY is not set. Get a key at https://openrouter.ai/keys and put it into .env',
       );
     }
-    const { system, user } = buildPrompt(input);
+    const { system, user } = buildPrompt(input, env.timezone);
     const headers: Record<string, string> = {
       Authorization: `Bearer ${this.apiKey}`,
       'Content-Type': 'application/json',
@@ -91,6 +91,7 @@ export class OpenRouterProvider implements AIProvider {
     }
     const content = data.choices?.[0]?.message?.content ?? '';
     if (!content) throw new Error('OpenRouter returned empty content');
-    return parseModelOutput(content);
+    const { actions, dropped } = parseModelActions(content, input);
+    return { tasks: actions, dropped };
   }
 }

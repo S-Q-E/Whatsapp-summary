@@ -1,45 +1,49 @@
-/** Начало локального дня в ms epoch. */
+import { env } from '../config/env.js';
+import { dayFromIso, endOfDay, startOfDay, toLocalDateString } from '../utils/time.js';
+
+/**
+ * Дата-хелперы дайджеста. Границы дня — в TIMEZONE из .env
+ * (а не в TZ процесса). Сигнатуры сохранены ради builder/скриптов/тестов.
+ */
+
+/** Начало локального дня (TIMEZONE) в ms epoch. */
 export function startOfLocalDay(d: Date): number {
-  const c = new Date(d);
-  c.setHours(0, 0, 0, 0);
-  return c.getTime();
+  return startOfDay(d, env.timezone);
 }
 
-/** 'YYYY-MM-DD' локальной даты. */
+/** 'YYYY-MM-DD' в TIMEZONE. */
 export function toIsoLocalDate(d: Date): string {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
+  return toLocalDateString(d.getTime(), env.timezone);
 }
 
-/** '5 октября' — заголовок отчёта. */
+/** '5 октября' — заголовок отчёта (русский, зона TIMEZONE). */
 export function formatDayLabel(d: Date): string {
-  return new Intl.DateTimeFormat('ru-RU', { day: 'numeric', month: 'long' }).format(d);
+  return new Intl.DateTimeFormat('ru-RU', { day: 'numeric', month: 'long', timeZone: env.timezone }).format(d);
 }
 
 /** '6 октября' — срок не на сегодня. */
 export function formatDeadlineDate(ms: number): string {
-  return new Intl.DateTimeFormat('ru-RU', { day: 'numeric', month: 'long' }).format(new Date(ms));
+  return new Intl.DateTimeFormat('ru-RU', { day: 'numeric', month: 'long', timeZone: env.timezone }).format(
+    new Date(ms),
+  );
 }
 
-const DAY_MS = 24 * 60 * 60 * 1000;
-
 /**
- * Разбирает --date CLI-аргумента. Возвращает Date на полдень указанного
- * локального дня (полдень — чтобы startOfLocalDay точно попал в тот же день
- * при любых TZ-сдвигах). Бросает Error на плохом вводе.
+ * Разбирает --date CLI-аргумента. 'today' — сейчас;
+ * 'YYYY-MM-DD' — полдень указанного дня в TIMEZONE (полдень, чтобы
+ * границы точно попали в тот же день). Бросает русскую ошибку на плохом вводе.
  */
 export function parseDayArg(dateStr: string | undefined): Date {
   const raw = dateStr ?? 'today';
-  const day = raw === 'today' ? new Date() : new Date(`${raw}T12:00:00`);
-  if (Number.isNaN(day.getTime()) || (raw !== 'today' && !/^\d{4}-\d{2}-\d{2}$/.test(raw))) {
-    throw new Error(`Bad --date "${raw}", expected YYYY-MM-DD or "today"`);
+  try {
+    if (raw === 'today') return new Date();
+    return new Date(dayFromIso(raw, env.timezone));
+  } catch {
+    throw new Error(`Плохой --date "${raw}", ожидается YYYY-MM-DD или "today"`);
   }
-  return day;
 }
 
 export function dayBounds(day: Date): { start: number; end: number } {
-  const start = startOfLocalDay(day);
-  return { start, end: start + DAY_MS };
+  const start = startOfDay(day, env.timezone);
+  return { start, end: endOfDay(day, env.timezone) };
 }

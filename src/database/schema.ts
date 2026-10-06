@@ -36,6 +36,14 @@ export const messages = sqliteTable(
     timestamp: integer('timestamp').notNull(),
     isFromMe: integer('is_from_me', { mode: 'boolean' }).notNull().default(false),
     createdAt: integer('created_at').notNull(),
+    /** FK -> chats.id (заполняется при ingest, шаг 2) */
+    chatId: integer('chat_id'),
+    /** инкрементальность анализа; правки/удаления сообщений */
+    processedAt: integer('processed_at'),
+    editedAt: integer('edited_at'),
+    deletedAt: integer('deleted_at'),
+    /** длительность медиа в секундах (голосовые/аудио/видео), шаг 4 */
+    durationSec: integer('duration_sec'),
   },
   (t) => [
     uniqueIndex('messages_wamid_chat_uidx').on(t.whatsappMessageId, t.chatJid),
@@ -47,35 +55,73 @@ export const messages = sqliteTable(
 export type ContactRow = typeof contacts.$inferSelect;
 export type MessageRow = typeof messages.$inferSelect;
 
-export const TASK_STATUSES = ['pending', 'completed', 'cancelled', 'uncertain'] as const;
+/**
+ * chats — один ряд на диалог (личка или группа).
+ * Канонический идентификатор диалогов: tasks/messages ссылаются на chat_id.
+ * chat_jid оставлен в messages/tasks как совместимость (денормализация).
+ */
+export const chats = sqliteTable('chats', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  jid: text('jid').notNull().unique(),
+  displayName: text('display_name'),
+  /** 0/1: группа (@g.us) или личка */
+  isGroup: integer('is_group').notNull().default(0),
+  createdAt: integer('created_at').notNull(),
+});
+
+export type ChatRow = typeof chats.$inferSelect;
+
+/**
+ * jid_aliases — соответствие LID ↔ номер телефона (шаг 4, Baileys 7).
+ * alias_jid (обычно @lid) -> canonical_jid (обычно @s.whatsapp.net).
+ * Чаты ведутся по canonical JID; при позднем обнаружении алиаса
+ * чаты сливаются, сообщения и задачи перепривязываются в транзакции.
+ */
+export const jidAliases = sqliteTable('jid_aliases', {
+  aliasJid: text('alias_jid').primaryKey(),
+  canonicalJid: text('canonical_jid').notNull(),
+  createdAt: integer('created_at').notNull(),
+});
+
+export type JidAliasRow = typeof jidAliases.$inferSelect;
+
+export const TASK_STATUSES = ['open', 'done', 'cancelled', 'needs_review'] as const;
 export type TaskStatus = (typeof TASK_STATUSES)[number];
 
 /**
  * tasks — обязательства врача, извлечённые AI из контекста переписки.
- * Одна строка = одно обязательство. Повторный анализ той же переписки
- * обновляет строку (reconcile по chat_jid + нормализованному title),
- * а не плодит дубли.
+ * Одна строка = одно обязательство. Идентификация СТРОГО по id:
+ * complete/cancel ссылаются на taskId, создание — всегда новая строка.
+ * Антидубль — только по source_message_id (UNIQUE, NULL не конфликтуют):
+ * одно сообщение-источник = максимум одна задача.
+ * Статусы legacy мапятся в миграции: pending->open, completed->done,
+ * uncertain->needs_review, cancelled->cancelled.
  *
- * model / prompt_version — provenance каждого AI-решения (какая модель,
- * какой версией промпта получен результат). confidence — уверенность 0..1.
- * deadline — конкретный срок в ms epoch или NULL, если срока нет;
- * deadline_text — исходная фраза («сегодня вечером») для вечерней выжимки.
+ * source_message_id / closed_by_message_id — внутренние messages.id
+ * (wamid от модели резолвится в id при сверке, scope — свой чат).
+ * model / prompt_version / confidence — provenance каждого AI-решения.
+ * due_at — конкретный срок в ms epoch или NULL; due_text — исходная фраза.
  */
 export const tasks = sqliteTable(
   'tasks',
   {
     id: integer('id').primaryKey({ autoIncrement: true }),
-    chatJid: text('chat_jid').notNull(),
-    contactId: integer('contact_id'),
+    chatId: integer('chat_id')
+      .notNull()
+      .references(() => chats.id),
     title: text('title').notNull(),
     description: text('description'),
-    sourceMessageId: text('source_message_id'),
+    contactId: integer('contact_id'),
+    /** legacy-зеркало chat_id, оставлено для совместимости чтения */
+    chatJid: text('chat_jid').notNull(),
+    sourceMessageId: integer('source_message_id').references(() => messages.id),
+    closedByMessageId: integer('closed_by_message_id').references(() => messages.id),
+    /** open | done | cancelled | needs_review */
+    status: text('status').notNull().default('open'),
     /** срок в ms epoch; NULL = срок не назван */
-    deadline: integer('deadline'),
+    dueAt: integer('due_at'),
     /** исходная формулировка срока из переписки */
-    deadlineText: text('deadline_text'),
-    /** pending | completed | cancelled | uncertain */
-    status: text('status').notNull().default('pending'),
+    dueText: text('due_text'),
     /** уверенность AI, 0..1 */
     confidence: real('confidence'),
     /** какая модель приняла решение (ollama-модель, heuristic-ru-v1, ...) */
@@ -84,12 +130,31 @@ export const tasks = sqliteTable(
     promptVersion: text('prompt_version'),
     createdAt: integer('created_at').notNull(),
     updatedAt: integer('updated_at').notNull(),
-    completedAt: integer('completed_at'),
+    closedAt: integer('closed_at'),
+    /**
+     * Ручное редактирование (шаг 6): 1 = задачу правил человек через API.
+     * AI такие задачи не перезаписывает (поля title/description/due),
+     * но переходы complete/cancel по taskId работают как обычно.
+     */
+    manual: integer('manual').notNull().default(0),
   },
   (t) => [
-    index('tasks_chat_idx').on(t.chatJid),
+    uniqueIndex('tasks_source_uidx').on(t.sourceMessageId),
+    index('tasks_chat_idx').on(t.chatId),
     index('tasks_status_idx').on(t.status),
   ],
 );
 
 export type TaskRow = typeof tasks.$inferSelect;
+
+/**
+ * settings — key/value хранилище серверных настроек
+ * (digest_time, timezone, owner_jid, ...). Значения — строки.
+ */
+export const settings = sqliteTable('settings', {
+  key: text('key').primaryKey(),
+  value: text('value').notNull(),
+  updatedAt: integer('updated_at').notNull(),
+});
+
+export type SettingsRow = typeof settings.$inferSelect;

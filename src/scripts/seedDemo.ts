@@ -1,7 +1,8 @@
 import { logger } from '../config/logger.js';
 import { closeDatabase, openDatabase } from '../database/db.js';
 import { FIXTURES } from '../ai/fixtures.js';
-import { startOfLocalDay } from '../ai/taskService.js';
+import { env } from '../config/env.js';
+import { startOfDay } from '../utils/time.js';
 import { storeMessage, upsertContact } from '../whatsapp/store.js';
 import type { ParsedMessage } from '../whatsapp/messageParser.js';
 
@@ -14,7 +15,7 @@ import type { ParsedMessage } from '../whatsapp/messageParser.js';
 async function main(): Promise<void> {
   const db = openDatabase(logger);
   try {
-    const dayStart = startOfLocalDay(new Date());
+    const dayStart = startOfDay(new Date(), env.timezone);
     let n = 0;
     for (const f of FIXTURES) {
       upsertContact(db, logger, { jid: f.chatJid, pushName: f.contactPushName });
@@ -26,6 +27,7 @@ async function main(): Promise<void> {
           senderName: m.direction === 'outgoing' ? null : m.senderName,
           direction: m.direction,
           messageType: m.messageType === 'text' ? 'text' : m.messageType,
+          durationSec: null,
           text: m.text,
           timestampMs: dayStart + m.minuteOffset * 60_000,
           isFromMe: m.direction === 'outgoing',

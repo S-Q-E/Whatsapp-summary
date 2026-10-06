@@ -40,6 +40,7 @@ export class PlainTextDigestRenderer implements DigestRenderer {
     lines.push(
       `Уверенность: высокая — ${s.confidenceHigh}, средняя — ${s.confidenceMedium}, низкая — ${s.confidenceLow}`,
     );
+    lines.push(`🎙 Непрослушанных голосовых: ${s.unheardVoice}`);
 
     return lines.join('\n');
   }

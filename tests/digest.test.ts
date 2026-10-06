@@ -15,6 +15,9 @@ function seed(): ReturnType<typeof openTestDb> {
 
   db.run(sql`INSERT INTO contacts (jid, phone, name, push_name, created_at, updated_at)
     VALUES ('a@s.whatsapp.net', '1', NULL, 'Айгуль', ${s}, ${s})`);
+  db.run(sql`INSERT INTO chats (jid, display_name, is_group, created_at)
+    VALUES ('a@s.whatsapp.net', 'Айгуль', 0, ${s})`);
+  const chatId = db.get<{ id: number }>(sql`SELECT id FROM chats WHERE jid = 'a@s.whatsapp.net'`)!.id;
 
   // Сообщения: 2 входящих сегодня + 1 исходящее сегодня + 1 входящее вчера.
   // Текст с маркером — для проверки, что он НЕ попадает в дайджест.
@@ -32,28 +35,28 @@ function seed(): ReturnType<typeof openTestDb> {
 
   // Задачи: id 1..7
   const tasks: Array<[string, string, number | null, string | null, number | null, number, number]> = [
-    // title, status, deadline, deadlineText, confidence, createdAt, updatedAt/completedAt
-    ['Просроченная', 'pending', s - HOUR, null, 0.9, s - 2 * 24 * HOUR, s - 2 * 24 * HOUR], // attention
-    ['Срок сегодня (ms)', 'pending', s + 5 * HOUR, null, 0.6, s, s], // attention
-    ['Срок сегодня (текст)', 'pending', null, 'сегодня вечером', 0.6, s, s], // attention
-    ['На завтра', 'pending', null, 'завтра утром', 0.6, s, s], // promised
-    ['Без срока', 'pending', null, null, 0.3, s, s], // promised, low
-    ['Сомнительная', 'uncertain', null, null, null, s, s], // attention (null conf -> medium)
-    ['Выполнена сегодня', 'completed', null, null, 0.95, s - 24 * HOUR, s + HOUR], // completed (completedAt=s+HOUR)
+    // title, status, dueAt, dueText, confidence, createdAt, updatedAt/closedAt
+    ['Просроченная', 'open', s - HOUR, null, 0.9, s - 2 * 24 * HOUR, s - 2 * 24 * HOUR], // attention
+    ['Срок сегодня (ms)', 'open', s + 5 * HOUR, null, 0.6, s, s], // attention
+    ['Срок сегодня (текст)', 'open', null, 'сегодня вечером', 0.6, s, s], // attention
+    ['На завтра', 'open', null, 'завтра утром', 0.6, s, s], // promised
+    ['Без срока', 'open', null, null, 0.3, s, s], // promised, low
+    ['Сомнительная', 'needs_review', null, null, null, s, s], // attention (null conf -> medium)
+    ['Выполнена сегодня', 'done', null, null, 0.95, s - 24 * HOUR, s + HOUR], // completed (closedAt=s+HOUR)
   ];
-  tasks.forEach(([title, status, deadline, dtext, conf, created, touched], i) => {
-    const completed = status === 'completed' ? touched : null;
+  tasks.forEach(([title, status, dueAt, dtext, conf, created, touched], i) => {
+    const closed = status === 'done' ? touched : null;
     db.run(sql`INSERT INTO tasks
-      (chat_jid, contact_id, title, description, source_message_id, deadline, deadline_text,
-       status, confidence, model, prompt_version, created_at, updated_at, completed_at)
-      VALUES ('a@s.whatsapp.net', 1, ${title}, NULL, ${`src${i}`}, ${deadline}, ${dtext},
-        ${status}, ${conf}, 'm', 'v1', ${created}, ${touched}, ${completed})`);
+      (chat_id, chat_jid, contact_id, title, description, source_message_id, due_at, due_text,
+       status, confidence, model, prompt_version, created_at, updated_at, closed_at)
+      VALUES (${chatId}, 'a@s.whatsapp.net', 1, ${title}, NULL, NULL, ${dueAt}, ${dtext},
+        ${status}, ${conf}, 'm', 'v1', ${created}, ${touched}, ${closed})`);
   });
   // Выполнена вчера + отменённая — в отчёт попасть не должны
-  db.run(sql`INSERT INTO tasks (chat_jid, title, status, confidence, created_at, updated_at, completed_at)
-    VALUES ('a@s.whatsapp.net', 'Вчерашняя', 'completed', 1, ${s - 2 * 24 * HOUR}, ${s - 24 * HOUR}, ${s - 24 * HOUR + HOUR})`);
-  db.run(sql`INSERT INTO tasks (chat_jid, title, status, created_at, updated_at)
-    VALUES ('a@s.whatsapp.net', 'Отменённая', 'cancelled', ${s}, ${s})`);
+  db.run(sql`INSERT INTO tasks (chat_id, chat_jid, title, status, confidence, created_at, updated_at, closed_at)
+    VALUES (${chatId}, 'a@s.whatsapp.net', 'Вчерашняя', 'done', 1, ${s - 2 * 24 * HOUR}, ${s - 24 * HOUR}, ${s - 24 * HOUR + HOUR})`);
+  db.run(sql`INSERT INTO tasks (chat_id, chat_jid, title, status, created_at, updated_at)
+    VALUES (${chatId}, 'a@s.whatsapp.net', 'Отменённая', 'cancelled', ${s}, ${s})`);
 
   return { db, close };
 }
@@ -129,7 +132,7 @@ describe('parseDayArg', () => {
   it('today и YYYY-MM-DD — ок, мусор — ошибка', () => {
     assert.ok(parseDayArg(undefined) instanceof Date);
     assert.equal(parseDayArg('2026-10-05').getDate(), 5);
-    assert.throws(() => parseDayArg('вчера'), /Bad --date/);
-    assert.throws(() => parseDayArg('05.10.2026'), /Bad --date/);
+    assert.throws(() => parseDayArg('вчера'), /Плохой --date/);
+    assert.throws(() => parseDayArg('05.10.2026'), /Плохой --date/);
   });
 });

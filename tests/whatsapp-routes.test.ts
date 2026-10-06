@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import Fastify from 'fastify';
-import { formatSseEvent, whatsappRoutes, type WhatsAppController } from '../src/server/routes/whatsapp.js';
+import { formatSseEvent, mapState, whatsappRoutes, type WhatsAppController } from '../src/server/routes/whatsapp.js';
 import type { StatusSnapshot } from '../src/whatsapp/status-store.js';
 
 function stubController(over: Partial<StatusSnapshot> = {}): WhatsAppController & { calls: string[] } {
@@ -15,35 +15,51 @@ function stubController(over: Partial<StatusSnapshot> = {}): WhatsAppController 
     ...over,
   };
   const calls: string[] = [];
+  const mapped = (s: StatusSnapshot): StatusSnapshot => s;
   return {
     calls,
     snapshot: () => snap,
-    qrSnapshot: () => ({ qr: 'QR-STRING', updatedAt: 456 }),
+    qrString: () => 'QR-STRING',
     on: () => () => {},
     disconnect: () => {
       calls.push('disconnect');
-      return { ...snap, status: 'disconnected', qrAvailable: false };
+      return mapped({ ...snap, status: 'disconnected', qrAvailable: false });
     },
     connect: async () => {
       calls.push('connect');
-      return { ...snap, status: 'connecting' };
+      return mapped({ ...snap, status: 'connecting' });
+    },
+    logout: async () => {
+      calls.push('logout');
+      return mapped({ ...snap, status: 'logged_out', phone: null });
     },
   };
 }
 
+const qrPng = async (s: string | null): Promise<string | null> =>
+  s ? `data:image/png;base64,QR(${s})` : null;
+
 async function buildApp(ctrl: WhatsAppController) {
   const app = Fastify();
-  await whatsappRoutes(app, ctrl);
+  await whatsappRoutes(app, ctrl, qrPng);
   return app;
 }
 
-describe('whatsapp routes', () => {
-  it('GET /api/whatsapp/status — контракт Zod', async () => {
+describe('whatsapp routes (шаг 5: mapped states, PNG QR, logout)', () => {
+  it('mapState: qr_pending→qr, connected→open, disconnected→closed', () => {
+    assert.equal(mapState('qr_pending'), 'qr');
+    assert.equal(mapState('connected'), 'open');
+    assert.equal(mapState('disconnected'), 'closed');
+    assert.equal(mapState('connecting'), 'connecting');
+    assert.equal(mapState('logged_out'), 'logged_out');
+  });
+
+  it('GET /api/whatsapp/status — mapped state', async () => {
     const app = await buildApp(stubController());
     const res = await app.inject({ method: 'GET', url: '/api/whatsapp/status' });
     assert.equal(res.statusCode, 200);
     assert.deepEqual(res.json(), {
-      status: 'qr_pending',
+      state: 'qr',
       phone: null,
       connectedAt: null,
       lastSeen: 123,
@@ -53,24 +69,29 @@ describe('whatsapp routes', () => {
     await app.close();
   });
 
-  it('GET /api/whatsapp/qr — сырая строка для фронта', async () => {
+  it('GET /api/whatsapp/qr — PNG data URL', async () => {
     const app = await buildApp(stubController());
     const res = await app.inject({ method: 'GET', url: '/api/whatsapp/qr' });
     assert.equal(res.statusCode, 200);
-    assert.deepEqual(res.json(), { qr: 'QR-STRING', updatedAt: 456 });
+    assert.match(res.json().dataUrl, /^data:image\/png;base64,/);
     await app.close();
   });
 
-  it('POST disconnect/connect вызывают контроллер и возвращают статус', async () => {
+  it('POST disconnect/connect/logout вызывают контроллер', async () => {
     const ctrl = stubController();
     const app = await buildApp(ctrl);
     const d = await app.inject({ method: 'POST', url: '/api/whatsapp/disconnect' });
     assert.equal(d.statusCode, 200);
-    assert.equal(d.json().status, 'disconnected');
+    assert.equal(d.json().state, 'closed');
     const c = await app.inject({ method: 'POST', url: '/api/whatsapp/connect' });
     assert.equal(c.statusCode, 200);
-    assert.equal(c.json().status, 'connecting');
-    assert.deepEqual(ctrl.calls, ['disconnect', 'connect']);
+    assert.equal(c.json().state, 'connecting');
+    const bad = await app.inject({ method: 'POST', url: '/api/whatsapp/logout', payload: {} });
+    assert.equal(bad.statusCode, 400);
+    const l = await app.inject({ method: 'POST', url: '/api/whatsapp/logout', payload: { confirm: true } });
+    assert.equal(l.statusCode, 200);
+    assert.equal(l.json().state, 'logged_out');
+    assert.deepEqual(ctrl.calls, ['disconnect', 'connect', 'logout']);
     await app.close();
   });
 

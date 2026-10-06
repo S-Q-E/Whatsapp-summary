@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { QrEvent } from '../../whatsapp/manager.js';
-import type { StatusSnapshot } from '../../whatsapp/status-store.js';
+import type { StatusSnapshot, WaStatus } from '../../whatsapp/status-store.js';
 
 /**
  * Минимальный интерфейс, нужный routes. WhatsAppManager его реализует;
@@ -10,14 +10,31 @@ import type { StatusSnapshot } from '../../whatsapp/status-store.js';
  */
 export type WhatsAppController = {
   snapshot(): StatusSnapshot;
-  qrSnapshot(): { qr: string | null; updatedAt: number | null };
+  qrString(): string | null;
   on(event: 'qr' | 'status', cb: (data: QrEvent | StatusSnapshot) => void): () => void;
   disconnect(): StatusSnapshot;
   connect(): Promise<StatusSnapshot>;
+  logout(): Promise<StatusSnapshot>;
 };
 
+/** Состояния наружу (шаг 5): qr_pending→qr, connected→open, disconnected→closed. */
+export type PublicWaState = 'connecting' | 'qr' | 'open' | 'closed' | 'logged_out';
+
+export function mapState(s: WaStatus): PublicWaState {
+  switch (s) {
+    case 'qr_pending':
+      return 'qr';
+    case 'connected':
+      return 'open';
+    case 'disconnected':
+      return 'closed';
+    default:
+      return s;
+  }
+}
+
 const StatusSchema = z.object({
-  status: z.enum(['connecting', 'qr_pending', 'connected', 'disconnected', 'logged_out']),
+  state: z.enum(['connecting', 'qr', 'open', 'closed', 'logged_out']),
   phone: z.string().nullable(),
   connectedAt: z.number().nullable(),
   lastSeen: z.number().nullable(),
@@ -26,8 +43,12 @@ const StatusSchema = z.object({
 });
 
 const QrSchema = z.object({
-  qr: z.string().nullable(),
+  dataUrl: z.string().nullable(),
   updatedAt: z.number().nullable(),
+});
+
+const LogoutSchema = z.object({
+  confirm: z.literal(true, { error: 'нужно тело {"confirm": true}' }),
 });
 
 /** Одна SSE-рамка. Вынесено для unit-тестов формата. */
@@ -37,9 +58,28 @@ export function formatSseEvent(event: string, data: unknown): string {
 
 const HEARTBEAT_MS = 25_000;
 
-export async function whatsappRoutes(app: FastifyInstance, ctrl: WhatsAppController): Promise<void> {
+function publicStatus(s: StatusSnapshot): z.infer<typeof StatusSchema> {
+  return {
+    state: mapState(s.status),
+    phone: s.phone,
+    connectedAt: s.connectedAt,
+    lastSeen: s.lastSeen,
+    hasSession: s.hasSession,
+    qrAvailable: s.qrAvailable,
+  };
+}
+
+export type QrRenderer = (qr: string | null) => Promise<string | null>;
+
+export async function whatsappRoutes(
+  app: FastifyInstance,
+  ctrl: WhatsAppController,
+  qrPng: QrRenderer,
+): Promise<void> {
+  const sendStatus = (s: StatusSnapshot) => StatusSchema.safeParse(publicStatus(s));
+
   app.get('/api/whatsapp/status', async (_req, reply) => {
-    const parsed = StatusSchema.safeParse(ctrl.snapshot());
+    const parsed = sendStatus(ctrl.snapshot());
     if (!parsed.success) {
       app.log.error({ issues: parsed.error.issues }, 'status snapshot violates contract');
       return reply.code(500).send({ error: 'internal contract violation' });
@@ -47,17 +87,17 @@ export async function whatsappRoutes(app: FastifyInstance, ctrl: WhatsAppControl
     return reply.send(parsed.data);
   });
 
+  // QR как PNG data URL: фронт показывает <img src=dataUrl>.
   app.get('/api/whatsapp/qr', async (_req, reply) => {
-    const parsed = QrSchema.safeParse(ctrl.qrSnapshot());
+    const qr = ctrl.qrString();
+    const parsed = QrSchema.safeParse({ dataUrl: qr ? await qrPng(qr) : null, updatedAt: Date.now() });
     if (!parsed.success) {
-      app.log.error({ issues: parsed.error.issues }, 'qr snapshot violates contract');
       return reply.code(500).send({ error: 'internal contract violation' });
     }
     return reply.send(parsed.data);
   });
 
   // Server-Sent Events: snapshot сразу, дальше qr/status по мере событий.
-  // Фронт: EventSource('/api/whatsapp/events'), рендер QR через qrcode.react.
   app.get('/api/whatsapp/events', (req, reply) => {
     reply.hijack();
     reply.raw.writeHead(200, {
@@ -73,9 +113,9 @@ export async function whatsappRoutes(app: FastifyInstance, ctrl: WhatsAppControl
         // client gone — cleanup below on 'close'
       }
     };
-    send('snapshot', ctrl.snapshot());
+    send('snapshot', publicStatus(ctrl.snapshot()));
     const offQr = ctrl.on('qr', (d) => send('qr', d));
-    const offStatus = ctrl.on('status', (d) => send('status', d));
+    const offStatus = ctrl.on('status', (d) => send('status', publicStatus(d as StatusSnapshot)));
     const hb = setInterval(() => {
       try {
         reply.raw.write(': ping\n\n');
@@ -91,17 +131,28 @@ export async function whatsappRoutes(app: FastifyInstance, ctrl: WhatsAppControl
   });
 
   app.post('/api/whatsapp/disconnect', async (_req, reply) => {
-    const parsed = StatusSchema.safeParse(ctrl.disconnect());
+    const parsed = sendStatus(ctrl.disconnect());
     if (!parsed.success) {
       return reply.code(500).send({ error: 'internal contract violation' });
     }
     return reply.send(parsed.data);
   });
 
-  // Вне спеки API (там только disconnect), но без неё UI не сможет
-  // переподключиться после ручного disconnect — маленькое расширение.
   app.post('/api/whatsapp/connect', async (_req, reply) => {
-    const parsed = StatusSchema.safeParse(await ctrl.connect());
+    const parsed = sendStatus(await ctrl.connect());
+    if (!parsed.success) {
+      return reply.code(500).send({ error: 'internal contract violation' });
+    }
+    return reply.send(parsed.data);
+  });
+
+  // Полный выход: закрыть соединение + стереть auth-сессию. Требует confirm.
+  app.post('/api/whatsapp/logout', async (req, reply) => {
+    const body = LogoutSchema.safeParse(req.body);
+    if (!body.success) {
+      return reply.code(400).send({ error: 'нужно тело {"confirm": true}' });
+    }
+    const parsed = sendStatus(await ctrl.logout());
     if (!parsed.success) {
       return reply.code(500).send({ error: 'internal contract violation' });
     }

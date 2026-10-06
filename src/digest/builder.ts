@@ -8,21 +8,21 @@ type TaskLite = {
   chatJid: string;
   title: string;
   status: string;
-  deadline: number | null;
-  deadlineText: string | null;
+  dueAt: number | null;
+  dueText: string | null;
   confidence: number | null;
   createdAt: number;
   updatedAt: number;
-  completedAt: number | null;
+  closedAt: number | null;
 };
 
 function loadAllTasks(db: Db): TaskLite[] {
   // Алиасы сразу в camelCase: raw sql`` имён не маппит (см. taskService.toTaskRow).
   return db.all<TaskLite>(sql`
-    SELECT id, chat_jid AS chatJid, title, status, deadline,
-           deadline_text AS deadlineText, confidence,
+    SELECT id, chat_jid AS chatJid, title, status, due_at AS dueAt,
+           due_text AS dueText, confidence,
            created_at AS createdAt, updated_at AS updatedAt,
-           completed_at AS completedAt
+           closed_at AS closedAt
     FROM tasks
   `);
 }
@@ -49,7 +49,7 @@ function deadlineTextMeansToday(deadlineText: string | null): boolean {
 
 /**
  * 🔴 Требует внимания: открытая задача, которую нельзя откладывать —
- * срок прошёл или истекает в день отчёта, либо статус uncertain
+ * срок прошёл или истекает в день отчёта, либо статус needs_review
  * (AI не уверен — нужно уточнение врача).
  */
 function isAttention(
@@ -57,19 +57,19 @@ function isAttention(
   dayStart: number,
   dayEnd: number,
 ): boolean {
-  if (t.status === 'uncertain') return true;
-  if (t.status !== 'pending') return false;
-  if (t.deadline !== null) return t.deadline <= dayEnd;
+  if (t.status === 'needs_review') return true;
+  if (t.status !== 'open') return false;
+  if (t.dueAt !== null) return t.dueAt <= dayEnd;
   const touchedToday = t.createdAt >= dayStart || t.updatedAt >= dayStart;
-  return touchedToday && deadlineTextMeansToday(t.deadlineText);
+  return touchedToday && deadlineTextMeansToday(t.dueText);
 }
 
 /** Человекочитаемый срок для карточки задачи. */
 function deadlineLabel(t: TaskLite, dayStart: number, dayEnd: number): string | null {
-  if (t.deadlineText) return t.deadlineText;
-  if (t.deadline === null) return null;
-  if (t.deadline >= dayStart && t.deadline < dayEnd) return 'сегодня';
-  return formatDeadlineDate(t.deadline);
+  if (t.dueText) return t.dueText;
+  if (t.dueAt === null) return null;
+  if (t.dueAt >= dayStart && t.dueAt < dayEnd) return 'сегодня';
+  return formatDeadlineDate(t.dueAt);
 }
 
 /**
@@ -77,9 +77,9 @@ function deadlineLabel(t: TaskLite, dayStart: number, dayEnd: number): string | 
  * задач — текст переписок сюда не попадает и дальше не уходит.
  *
  * Состав секций:
- * - completed: выполненные именно в день отчёта (completed_at в дне);
+ * - completed: выполненные именно в день отчёта (closed_at в дне);
  * - attention: открытые, срочные по правилу isAttention (включая старые просроченные);
- * - promised: остальные открытые (pending, срок в будущем или без срока).
+ * - promised: остальные открытые (open, срок в будущем или без срока).
  */
 export function buildDigest(db: Db, day: Date): DailyDigest {
   const { start, end } = dayBounds(day);
@@ -96,12 +96,12 @@ export function buildDigest(db: Db, day: Date): DailyDigest {
     confidence: t.confidence,
   });
 
-  const open = tasks.filter((t) => t.status === 'pending' || t.status === 'uncertain');
+  const open = tasks.filter((t) => t.status === 'open' || t.status === 'needs_review');
   const attention = open.filter((t) => isAttention(t, start, end)).map(toItem);
   const attentionIds = new Set(attention.map((t) => t.id));
   const promised = open.filter((t) => !attentionIds.has(t.id)).map(toItem);
   const completed = tasks
-    .filter((t) => t.status === 'completed' && t.completedAt !== null && t.completedAt >= start && t.completedAt < end)
+    .filter((t) => t.status === 'done' && t.closedAt !== null && t.closedAt >= start && t.closedAt < end)
     .map(toItem);
 
   const byId = (a: DigestTaskItem, b: DigestTaskItem): number => a.id - b.id;
@@ -114,7 +114,12 @@ export function buildDigest(db: Db, day: Date): DailyDigest {
     WHERE direction = 'incoming' AND timestamp >= ${start} AND timestamp < ${end}
   `);
 
-  const withoutDeadline = open.filter((t) => t.deadline === null).length;
+  const unheardVoice = db.get<{ n: number }>(sql`
+    SELECT COUNT(*) AS n FROM messages
+    WHERE message_type = 'voice' AND processed_at IS NULL AND deleted_at IS NULL
+  `);
+
+  const withoutDeadline = open.filter((t) => t.dueAt === null).length;
   let high = 0;
   let medium = 0;
   let low = 0;
@@ -137,6 +142,7 @@ export function buildDigest(db: Db, day: Date): DailyDigest {
       confidenceHigh: high,
       confidenceMedium: medium,
       confidenceLow: low,
+      unheardVoice: unheardVoice?.n ?? 0,
     },
   };
 }

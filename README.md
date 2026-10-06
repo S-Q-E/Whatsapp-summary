@@ -11,10 +11,11 @@
 
 1. **Drizzle ORM + better-sqlite3 (не Prisma).**
    Для маленького локального приложения Drizzle легче: нет отдельного
-   query-engine / бинарника, синхронный драйвер, SQL рядом с кодом,
-   `drizzle-kit` только для будущих версионированных миграций.
-   Таблицы создаются идемпотентно при старте (`CREATE TABLE IF NOT EXISTS`),
-   поэтому первый запуск работает без отдельных `migrate`-шагов.
+   query-engine / бинарника, синхронный драйвер, SQL рядом с кодом.
+   Схема версионируется: `drizzle-kit generate` → `drizzle/0000_*.sql`,
+   при старте выполняется программный `migrate()`. Старые БД, созданные
+   до миграций, подхватываются baseline-стратегией без потери данных
+   (журнал помечается применённым, недостающие таблицы достраиваются).
 2. **Baileys 7.x, ESM-only.** В проекте `"type": "module"`, импорты Baileys
    через `import`. `printQRInTerminal` удалён — QR рендерим сами через
    `qrcode-terminal` из события `connection.update`.
@@ -59,7 +60,8 @@ cp .env.example .env   # при желании поправь пути и уро
 ## Запуск
 
 ```bash
-npm run dev     # разработка (tsx watch)
+npm run dev     # всё одним процессом: БД + WhatsApp + анализ + API (tsx watch)
+npm run dev:ingest  # только ingestion без HTTP, для отладки
 # или
 npm run build && npm start
 ```
@@ -72,18 +74,18 @@ npm run typecheck
 
 ## Где появляется QR и как подключить WhatsApp
 
-1. Запусти `npm run dev`.
-2. В терминале увидишь:
-   `WARN: QR received — scan with WhatsApp: Settings > Linked devices > Link a device`
-   и ASCII QR-код ниже.
-3. На телефоне: **WhatsApp → Настройки → Связанные устройства → Привязать устройство**,
-   наведи камеру на QR в терминале.
-4. После сканирования сокет принудительно переподключится
+1. Запусти `npm run dev`, открой в браузере `http://127.0.0.1:3000/api/whatsapp/qr`
+   (фронтенд со сканером — следующий шаг; пока там JSON с PNG data URL,
+   который можно открыть как картинку).
+2. На телефоне: **WhatsApp → Настройки → Связанные устройства → Привязать устройство**,
+   наведи камеру на QR.
+3. После сканирования сокет принудительно переподключится
    (`restartRequired`) — это нормально, клиент переподключается сам.
-   Увидишь `whatsapp connected`.
-5. При следующих запусках QR **не** показывается — сессия переиспользуется
+4. При следующих запусках QR **не** показывается — сессия переиспользуется
    из `AUTH_DIR`. QR появится снова только если сессия отозвана (401)
-   или папка auth удалена.
+   или вызван `POST /api/whatsapp/logout` с `{"confirm": true}`.
+5. В терминал QR больше не печатается (только в WEB); для standalone-режима
+   с QR в терминале: `QR_TERMINAL=true npm run dev:ingest`.
 
 ## Где что хранится
 
@@ -118,9 +120,23 @@ sqlite3 data/whatsapp.db "SELECT chat_jid, direction, message_type, datetime(tim
 4. Проверка дедупликации: перезапусти приложение — повторная доставка
    тех же событий не увеличивает счётчик (`isNew=false`, `ON CONFLICT DO NOTHING`).
 
-Что сохраняется для нетиповых сообщений: изображения/голосовые/документы
-хранятся как `message_type=image/audio/document/...` с подписью (caption),
-если она есть, и `NULL`-текстом, если её нет. Медиафайлы не скачиваются.
+Что сохраняется для нетиповых сообщений (честно, без обещаний):
+- исчезающие/одноразовые/`documentWithCaption` разворачиваются до внутреннего
+  текста через `normalizeMessageContent` — иначе текст терялся бы;
+- изображения/видео/документы — `message_type` + подпись (caption), если есть,
+  иначе `NULL`; медиафайлы не скачиваются;
+- голосовые (`ptt`) — отдельный тип `voice` + длительность `duration_sec`;
+  обычное аудио — `audio`. Транскрибации НЕТ (отдельный шаг позже), в дайджесте
+  только счётчик непрослушанных;
+- правки (`messages.update` / protocol-edit) обновляют текст + `edited_at`
+  и возвращают сообщение на переанализ; удаления ставят `deleted_at`
+  (текст остаётся локально для аудита, в AI-контекст не попадает);
+- реакции (`reaction`) и системные (`protocol`) хранятся, но в AI-контекст
+  не попадают; удалённые сообщения — тоже;
+- LID↔номер: таблица `jid_aliases`, чаты ведутся по каноническому JID
+  (PN побеждает LID); поздний алиас сливает чаты в транзакции;
+- группы: имя группы сохраняется в `chats.display_name`, автор каждой
+  реплики подписан именем в AI-контексте.
 
 ## Безопасное отключение
 
@@ -149,24 +165,31 @@ sqlite3 data/whatsapp.db "SELECT chat_jid, direction, message_type, datetime(tim
 
 ```
 src/
-  index.ts                 # entrypoint ingestion, graceful shutdown (SIGINT/SIGTERM)
+  index.ts                 # только запускает app (шаг 5)
+  app.ts                   # composition root: БД + WA + планировщик + Fastify
   config/
-    env.ts                 # dotenv + типизированные настройки (incl. AI_*)
+    env.ts                 # zod-конфиг (incl. AI_*, WEB_*, ANALYZE_*)
     logger.ts              # pino + logStoredMessage без утечек текста
   database/
-    schema.ts              # drizzle-схема contacts/messages/tasks + индексы
-    db.ts                  # better-sqlite3 (WAL) + идемпотентный bootstrap DDL
-  whatsapp/                # ingestion — логика НЕ менялась, добавлены только hooks
-    connection.ts          # Baileys 7.x: auth, QR, reconnect, logout, подписки (+ClientHooks)
+    schema.ts              # drizzle-схема contacts/messages/tasks/settings + индексы
+    db.ts                  # openDatabase: программный migrate() + baseline legacy-БД
+    repositories/
+      settings.ts          # key/value настройки (digest_time, owner_jid, ...)
+  whatsapp/                # ingestion: парсинг, правки/удаления, алиасы, супервизор
+    connection.ts          # Baileys 7.x: auth, QR, reconnect, logout, подписки (+ClientHooks, ReconnectSupervisor)
     manager.ts             # владелец соединения в серверном режиме, жизненный цикл
     qr-manager.ts          # последний QR для WEB (сырая строка, рендерит фронт)
     status-store.ts        # connecting|qr_pending|connected|disconnected|logged_out
-    messageParser.ts       # WAMessage -> плоская структура (текст/группы/медиа-капшены)
-    store.ts               # upsert contacts + idempotent INSERT messages
-  server/                  # PHASE 1: Fastify (фронтенд — Phase 2)
-    index.ts               # boot: DB + WhatsAppManager + routes, graceful shutdown
+    messageParser.ts       # normalizeMessageContent, voice/edit/revoke, durationSec
+    store.ts               # upsert contacts/chats, INSERT messages, applyEdit/applyRevoke, jid_aliases, mergeChats
+  server/                  # Fastify: auth, QR-PNG, routes (фронтенд — следующий шаг)
+    auth.ts                # сессии в памяти, constant-time пароль, rate limit
+    qr.ts                  # QR → PNG data URL с кэшем
     routes/
-      whatsapp.ts          # status/qr/events(SSE)/disconnect/connect, Zod-контракты
+      whatsapp.ts          # status/qr/events(SSE)/disconnect/connect/logout, Zod-контракты
+      tasks.ts             # dashboard/tasks CRUD/context через query builder
+web/
+  src/                     # React: api.ts, App (hash-роутер), pages (Login/WhatsApp/Dashboard/Tasks)
   ai/                      # этап 2: извлечение обязательств врача
     types.ts               # AIProvider, ConversationInput/Output, ExtractedTask
     prompts.ts             # PROMPT_VERSION + сборка промпта (JSON-контракт)
@@ -178,7 +201,8 @@ src/
       heuristic.ts         # rule-based RU-фолбэк (честно помечен, не LLM)
       mock.ts              # canned-ответы для тестов
     fixtures.ts            # 6 синтетических переписок без ПДн
-    taskService.ts         # bundles по chat_jid -> AI -> reconcile (create/update, без дублей)
+    taskService.ts         # bundles -> AI -> reconcile (id, антидубль по источнику)
+    analyzeScheduler.ts    # планировщик: mutex, лимит чатов, таймауты, метрики
   digest/                  # этап 3: дневной отчёт (только чтение, без отправки)
     types.ts               # DailyDigest, DigestStats, интерфейс DigestRenderer
     date.ts                # parseDayArg, границы дня, русские подписи дат
@@ -186,17 +210,23 @@ src/
     renderer.ts            # PlainTextDigestRenderer (Telegram/WhatsApp-safe plain text)
   utils/
     jid.ts                 # normalizeJid / phoneFromJid / isGroupJid
+    time.ts                # startOfDay/endOfDay/formatLocal/toLocalDateString (Intl, зона из TIMEZONE)
   scripts/
     stats.ts               # npm run db:stats — проверка, что ingestion работает
     logout.ts              # npm run session:logout — полный выход + wipe auth
-    analyze.ts             # npm run analyze — анализ дня -> tasks -> печать
+    ingest.ts              # npm run dev:ingest — standalone ingestion без HTTP
+    analyze.ts             # npm run analyze — ручной разбор (планировщик делает то же по cron)
     seedDemo.ts            # npm run seed:demo — синтетические переписки в БД
     digest.ts              # npm run digest — дневной отчёт (builder + renderer)
 tests/
-  validate.test.ts         # JSON-контракт: valid/пусто/ограждения/плохие status, confidence, deadline
-  reconcile.test.ts        # сверка: create/provenance/антидубль/completion/uncertain
+  app.test.ts              # API через inject (auth/rate-limit/logout/QR/system), mutex планировщика
+  dashboard.test.ts        # dashboard/tasks/context endpoints, manual-флаг против AI
+  validate.test.ts         # wire-контракт v3: ссылки t/m, дропы, структурные ошибки
+  reconcile.test.ts        # сверка по id: create/complete/cancel/антидубль/scope чата
+  reconcile-bugs.test.ts   # регрессия багов шага 2: повтор через неделю, похожие названия
   heuristicFixtures.test.ts# поведение на фикстурах: обещания->задачи, спасибо/вопросы->0
   digest.test.ts           # секции/статистика/порядок/нумерация/отсутствие текста переписок
+  whatsapp-ingest.test.ts  # обёртки/viewOnce/voice/edit/revoke/алиасы/слияние/супервизор
 ```
 
 ## AI-анализ: как это работает
@@ -215,16 +245,30 @@ tests/
    - `heuristic` — только локальные правила (офлайн-демо);
    - `mock` — только для тестов.
    Опции CLI: `--provider=... --date=YYYY-MM-DD --chat=<подстрока-jid>`.
-4. Правила извлечения (и в промпте `task-extract-v1`, и в эвристике):
-   задача = подтверждённое обязательство ВРАЧА; «спасибо» и ответы на вопросы
-   задачами НЕ считаются; отчёт врача о выполнении переводит задачу
-   в `completed` (update по названию, а не новая строка).
-5. Проверки: `npm test` (36 тестов), `npm run typecheck`, `npm run build`.
+4. Правила извлечения (промпт `task-extract-v3`, история версий в `prompts.ts`):
+   задача = обязательство ВРАЧА или принятая им просьба; «спасибо», вопросы
+   и ответы-факты — не задачи. Контекст: последние N сообщений чата
+   (`AI_CONTEXT_LIMIT`, default 40, за `AI_CONTEXT_DAYS`, default 14) +
+   все открытые задачи. Сообщения keyed `m<messages.id>`, задачи `t<id>`,
+   время в TIMEZONE со смещением. Ответ модели: `{"actions": [...]}` со
+   ссылками вида `taskId: "t12"`, `evidenceMessageId: "m34"`; битые ссылки
+   отбрасываются (в лог — только id, без текста), структурная ошибка —
+   один retry. Инкрементальность: разбираются только чаты с
+   `processed_at IS NULL`; после успеха сообщения помечаются, при ошибке —
+   остаются на следующий прогон. Идентификация строго по id; антидубль —
+   UNIQUE по источнику. `auto`-провайдер не залипает (primary пробуется
+   каждый раз); fallback на эвристику выключен по умолчанию
+   (`ALLOW_HEURISTIC_FALLBACK=false`), при включении её create → needs_review.
+5. Проверки: `npm test` (74 теста), `npm run typecheck`, `npm run build`.
 
-Таблица `tasks`: `chat_jid, contact_id, title, description, source_message_id,`
-`deadline` (ms epoch или NULL), `deadline_text` (исходная фраза),
-`status` (pending|completed|cancelled|uncertain), `confidence` (0..1),
-`model`, `prompt_version`, `created_at`, `updated_at`, `completed_at`.
+Таблица `tasks`: `chat_id` (FK → chats), `title`, `description`,
+`source_message_id` (FK → messages.id, wamid резолвится при сверке),
+`closed_by_message_id`, `status` (open|done|cancelled|needs_review),
+`due_at` (ms epoch или NULL), `due_text` (исходная фраза),
+`confidence`, `model`, `prompt_version`, `created_at`, `updated_at`, `closed_at`.
+Миграции: `drizzle/` (`0000` — baseline схемы, `0001` — chats/id с переносом
+данных и маппингом статусов pending→open, completed→done, uncertain→needs_review).
+Таблица `chats`: диалоги (лички и группы), задачи и сообщения ссылаются на `chat_id`.
 
 Ограничения эвристики: понимает только явные глаголы 1-го лица
 («посмотрю», «отправлю», «уточню»); инфинитивы («скинуть») игнорирует
@@ -258,7 +302,7 @@ npm run digest -- --date=2026-10-05   # отчёт за конкретную д�
 Слой `src/digest/` — чистые данные + формат, без отправки:
 - `builder.ts` (`buildDigest`) — только чтение SQLite: задачи раскладываются
   в 🔴 Требует внимания (срок прошёл/истекает сегодня, включая старые
-  просроченные; `uncertain` — всегда), 🟡 Обещано (остальные открытые),
+  просроченные; `needs_review` — всегда), 🟡 Обещано (остальные открытые),
   ✅ Выполнено (завершённые в день отчёта); считает входящие за день,
   активные/выполненные/без срока и разбивку уверенности
   (high ≥ 0.8, medium 0.5–0.8, low < 0.5). Текст переписок в дайджест не попадает.
@@ -266,31 +310,59 @@ npm run digest -- --date=2026-10-05   # отчёт за конкретную д�
   plain text + эмодзи без markdown-разметки: одинаково уйдёт и в Telegram,
   и в WhatsApp. Новый канал доставки = новый класс рендера, builder и CLI не меняются.
 
-## PHASE 1: Backend + QR API (выполнено, проверено вживую)
-
-HTTP-сервер владеет Baileys-соединением; ingestion продолжается внутри
-`connection.ts` без изменений логики.
+## Шаг 5: один процесс (app + планировщик + API)
 
 ```bash
-npm run dev:server   # http://127.0.0.1:3000 (SERVER_HOST/SERVER_PORT в .env)
+npm run dev        # всё одним процессом: БД + WhatsApp + анализ по расписанию + API
 ```
+
+`src/index.ts` только запускает `src/app.ts` (composition root).
+`src/scripts/ingest.ts` (`npm run dev:ingest`) — standalone ingestion
+без HTTP для отладки. `src/server/index.ts` удалён (влит в `app.ts`).
+
+Планировщик (`src/ai/analyzeScheduler.ts`): каждые `ANALYZE_INTERVAL_MIN`
+(default 2) разбирает чаты с необработанными сообщениями, максимум
+`ANALYZE_MAX_CHATS` (default 10) за проход, один проход за раз (mutex),
+таймаут на чат, ошибки провайдера считаются и не трогают сообщения.
+Метрики + число необработанных — в `GET /api/system/status`.
+
+API (`/api`, ответы валидируются Zod):
 
 | Метод | Путь | Назначение |
 |---|---|---|
-| GET | `/api/health` | живость |
-| GET | `/api/whatsapp/status` | `{status, phone, connectedAt, lastSeen, hasSession, qrAvailable}` |
-| GET | `/api/whatsapp/qr` | сырая QR-строка (рендер — `qrcode.react` в Phase 2) |
-| GET | `/api/whatsapp/events` | SSE: `snapshot` сразу, дальше `qr`/`status`, heartbeat `: ping` |
+| GET | `/health`, `/api/health` | живость (без авторизации) |
+| POST | `/api/auth/login` | вход по `WEB_PASSWORD`, httpOnly-сессия, rate limit |
+| GET | `/api/whatsapp/status` | `{state: connecting\|qr\|open\|closed\|logged_out, ...}` |
+| GET | `/api/whatsapp/qr` | `{dataUrl: PNG data URL \| null}` — в браузере виден QR |
+| GET | `/api/whatsapp/events` | SSE: `snapshot` → `qr`/`status` |
 | POST | `/api/whatsapp/disconnect` | закрыть соединение, сессию сохранить |
-| POST | `/api/whatsapp/connect` | переподключить (расширение спеки — иначе UI нечем встать после disconnect) |
+| POST | `/api/whatsapp/connect` | переподключить |
+| POST | `/api/whatsapp/logout` | тело `{"confirm": true}` — закрыть + стереть сессию |
+| GET | `/api/system/status` | метрики анализа, необработанные, ошибки провайдера |
+| GET | `/api/dashboard` | счётчики за день: сообщений, открытых, просроченных, выполненных, needs_review |
+| GET | `/api/tasks?status=&chatId=` | список задач (без текстов переписок) |
+| POST | `/api/tasks` | ручное создание `{chatId\|chatJid, title}` → `manual=1` |
+| PATCH | `/api/tasks/:id` | `{status, title, description, dueAt}` → `manual=1` |
+| GET | `/api/tasks/:id/context` | ±5 сообщений вокруг источника с флагами `isSource`/`isClosing` |
 
-Статусы: `connecting | qr_pending | connected | disconnected | logged_out`.
-При `logged_out` (401) локальная auth-сессия стирается автоматически,
-UI возвращается в «Scan QR». Рестарт сервера — без повторного QR.
-Auth credentials в API не отдаются никогда. Все ответы валидируются Zod.
-Полный разнос `whatsapp/` на `client/auth/message-handler/sender` —
-в фазах 3 и 8 вместе с owner-логикой и отправкой; дублировать рабочий код
-ради структуры сейчас не стали.
+Авторизация: сессии в памяти, cookie `wasec` (httpOnly, SameSite=Lax),
+пароль сверяется в constant-time. Без `WEB_PASSWORD` сервер стартует
+только на `127.0.0.1`. QR в терминал выключен по умолчанию
+(`QR_TERMINAL=false`); в WEB — через `/api/whatsapp/qr`.
+
+## Шаг 6: дашборд и задачи (API + web/)
+
+`web/` — Vite + React + Tailwind, mobile-first, русский язык:
+вход по паролю, экран «Подключить WhatsApp» (QR-картинка, опрос статуса
+каждые 3 сек), дашборд (статус, счётчики, блок внимания), задачи
+(фильтры, карточки: пациент, формулировка, срок, кнопки «Готово» /
+«Не нужно» / «Перенести», раскрывающийся контекст переписки, ручное
+создание). Тексты сообщений — только в раскрытом контексте, в списках
+их нет. Сборка (`npm run build:web` → `web/dist`) раздаётся Fastify
+как статика со SPA-fallback; без сборки API работает как раньше.
+`npm run dev:web` — разработка фронта (proxy `/api` → :3000).
+Ручные правки ставят `manual=1`; AI такие задачи не перезаписывает
+(переходы complete/cancel по taskId работают, поля — нет).
 
 ## Что дальше (не в этом этапе)
 

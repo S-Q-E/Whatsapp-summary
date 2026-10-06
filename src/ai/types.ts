@@ -4,17 +4,21 @@ export type TaskStatus = (typeof TASK_STATUSES)[number];
 
 /** Одно сообщение переписки в том виде, в каком его видит AI. */
 export type ConversationMessage = {
+  /** внутренний messages.id — в промпте фигурирует как ключ m<id> */
+  id: number;
   direction: 'incoming' | 'outgoing';
   senderName: string | null;
   /** null для медиа без подписи — AI видит только [image]/[audio]/... */
   text: string | null;
   messageType: string;
+  /** секунды для voice/audio/video, иначе null */
+  durationSec: number | null;
   /** ms epoch, для понимания «сегодня/завтра» */
   timestamp: number;
   whatsappMessageId: string;
 };
 
-/** Уже известные открытые задачи чата — чтобы AI обновлял, а не дублировал. */
+/** Уже известные открытые задачи чата — AI закрывает их по id. */
 export type ExistingTaskSummary = {
   id: number;
   title: string;
@@ -31,30 +35,53 @@ export type ConversationInput = {
   analyzedAt: number;
 };
 
+export type TaskAction = 'create' | 'complete' | 'cancel';
+
 /**
- * Одна задача в ответе AI.
- * - create: новое обязательство врача.
- * - update: изменение уже известной задачи (matchTitle — её название);
- *   главный кейс — врач выполнил обещанное -> status completed.
+ * Сырое действие из ответа модели (wire-контракт, см. промпт v3).
+ * Ссылки — ключами промпта: taskId "t12" (известная открытая задача),
+ * evidenceMessageId "m34" (сообщение из контекста). Проверяются
+ * в validate по известным множествам id; битые ссылки отбрасываются.
  */
-export type ExtractedTask = {
-  action: 'create' | 'update';
-  matchTitle: string | null;
+export type WireAction = {
+  type: TaskAction;
+  taskId: string | null;
   title: string;
   description: string | null;
+  dueAt: string | null;
+  dueText: string | null;
+  evidenceMessageId: string | null;
+  confidence: number;
+};
+
+/**
+ * Проверенное внутреннее действие для reconcile.
+ * - create: новое обязательство врача → всегда НОВАЯ строка в БД.
+ * - complete/cancel: переход известной задачи по taskId (числу).
+ * - messageId: внутренний messages.id доказательства (обещания/отчёта).
+ */
+export type ExtractedTask = {
+  action: TaskAction;
+  /** обязателен для complete/cancel, запрещён для create */
+  taskId: number | null;
+  title: string;
+  description: string | null;
+  /** для create: 'open' | 'needs_review' */
   status: TaskStatus;
-  /** ISO 8601 дата/время срока; null если срок не назван */
-  deadline: string | null;
+  /** ISO 8601 со смещением; null если срок не назван */
+  dueAt: string | null;
   /** исходная фраза срока из переписки («сегодня вечером»), null если нет */
-  deadlineText: string | null;
+  dueText: string | null;
   /** 0..1 */
   confidence: number;
-  /** whatsapp_message_id сообщения-источника (обещания или отчёта) */
-  sourceMessageId: string | null;
+  /** внутренний messages.id сообщения-доказательства */
+  messageId: number | null;
 };
 
 export type AnalyzeOutput = {
   tasks: ExtractedTask[];
+  /** отброшенные действия (битые ссылки): только индексы и ключи, без текста */
+  dropped?: string[];
 };
 
 /**

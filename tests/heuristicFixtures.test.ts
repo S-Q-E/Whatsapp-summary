@@ -12,14 +12,20 @@ function toInput(fixtureId: string): ConversationInput {
     chatJid: f.chatJid,
     contactName: f.contactPushName,
     messages: f.messages.map((m, i) => ({
+      id: 100 + i,
       direction: m.direction,
       senderName: m.senderName,
       text: m.text,
       messageType: m.messageType,
+      durationSec: null,
       timestamp: 1_700_000_000_000 + m.minuteOffset * 60_000,
       whatsappMessageId: `t-${fixtureId}-${i}`,
     })),
-    existingTasks: [],
+    // completion-report: известная открытая задача, которую закрывает отчёт
+    existingTasks:
+      fixtureId === 'completion-report'
+        ? [{ id: 41, title: 'Посмотреть анализы', status: 'open' as const }]
+        : [],
     analyzedAt: 1_700_000_000_000,
   };
 }
@@ -44,12 +50,14 @@ describe('HeuristicProvider на синтетических переписках
     assert.equal(q.tasks.length, 0);
   });
 
-  it('обещание содержит deadlineText, выполнение — completed', async () => {
+  it('обещание содержит dueText, выполнение — complete по id', async () => {
     const p = await provider.analyzeConversation(toInput('analyses-evening'));
     assert.ok(p.tasks[0]?.title.toLowerCase().includes('анализы'));
-    assert.equal(p.tasks[0]?.deadlineText, 'сегодня вечером');
+    assert.equal(p.tasks[0]?.dueText, 'сегодня вечером');
+    assert.equal(p.tasks[0]?.messageId, 101);
     const c = await provider.analyzeConversation(toInput('completion-report'));
-    assert.equal(c.tasks[0]?.action, 'update');
-    assert.equal(c.tasks[0]?.status, 'completed');
+    assert.equal(c.tasks[0]?.action, 'complete');
+    assert.equal(c.tasks[0]?.taskId, 41);
+    assert.equal(c.tasks[0]?.status, 'done');
   });
 });

@@ -1,56 +1,74 @@
+import { formatLocal } from '../utils/time.js';
+import { msgKey, taskKey } from './context.js';
 import type { ConversationInput } from './types.js';
 
 /**
- * Prompt versioning: КАЖДЫЙ результат AI сохраняет prompt_version
- * (см. tasks.prompt_version). Правила:
- * - любое изменение текста промпта или JSON-контракта => новая версия
- *   вида 'task-extract-vN' (v1, v2, ...), старую не удалять из истории git;
- * - провайдеры берут версию отсюда, а не хардкодят свою;
- * - сравнение качества версий — по tasks.confidence + ручной проверке.
+ * История версий (v1/v2 живут в git-истории, не удалять):
+ * - v1: контракт create|update + matchTitle (сопоставление по названию);
+ * - v2: контракт create|complete|cancel + taskId числом, источник — wamid;
+ * - v3: ссылки ключами промпта (t<id>/m<id>), время в TIMEZONE со смещением.
  */
-export const PROMPT_VERSION = 'task-extract-v1';
+export const PROMPT_VERSION = 'task-extract-v3';
 
 const SYSTEM_PROMPT = `Ты — секретарь врача. Анализируешь КОНТЕКСТ переписки врача с пациентом или коллегой и извлекаешь ОБЯЗАТЕЛЬСТВА ВРАЧА — конкретные дела, которые врач пообещал сделать.
 
 КРИТИЧЕСКИ ВАЖНЫЕ ПРАВИЛА:
-1. Задача — это только конкретное обязательство ВРАЧА (автор сообщений "ВРАЧ"), подтверждённое врачом: посмотреть анализы, отправить документ/результаты, позвонить, написать, уточнить информацию, напомнить о приёме.
+1. Задача — это только конкретное обязательство ВРАЧА (автор сообщений "ВРАЧ") или принятая врачом просьба: посмотреть анализы, отправить документ/результаты, позвонить, написать, уточнить информацию, напомнить о приёме.
 2. НЕ создавай задачу, если:
    - пациент просто благодарит ("Спасибо!"), а врач вежливо отвечает;
    - пациент задаёт вопрос, а врач просто отвечает фактом ("Вы сегодня принимаете?" — "Да, с 9 до 13"). Это ответ, а не обязательство;
-   - просьба пациента осталась БЕЗ подтверждения врача;
+   - просьба пациента осталась БЕЗ принятия врачом;
    - сообщение — smalltalk без конкретных действий.
-3. Если врач позже сообщает о выполнении ("Посмотрела ваши анализы, всё в норме", "Отправила результаты") — это НЕ новая задача, а завершение существующей: верни action "update", matchTitle с названием задачи из списка известных задач, status "completed".
-4. Если уверенность низкая (намёк без явного обещания) — всё равно верни задачу, но со status "uncertain" и честной confidence.
-5. Срок (deadline): только если назван явно ("сегодня вечером", "завтра утром", конкретная дата). Отсчитывай от текущего времени, указанного во входных данных. Формат deadline — ISO 8601. В deadlineText сохрани исходную фразу. Если срока нет — оба поля null.
-6. Отвечай СТРОГО одним JSON-объектом без пояснений, markdown и комментариев:
-{"tasks": [{"action": "create|update", "matchTitle": string|null, "title": string, "description": string|null, "status": "pending|completed|cancelled|uncertain", "deadline": string|null, "deadlineText": string|null, "confidence": 0..1, "sourceMessageId": string|null}]}
-Пустой результат: {"tasks": []}.`;
+3. Если врач сообщает о выполнении известной задачи ("Посмотрела ваши анализы, всё в норме", "Отправила результаты") — это НЕ новая задача: верни action "complete" с taskId этой задачи. taskId бери ТОЛЬКО из списка известных задач ниже ("t12" — taskId "t12"). Не выдумывай id. Если похожей задачи в списке нет — ничего не возвращай по этому поводу.
+4. Если врач отменяет обещанное ("Не смогу позвонить, давайте перенесём") — верни action "cancel" с taskId из списка.
+5. Если уверенность низкая (намёк без явного обещания) — всё равно верни задачу action "create", но со status "needs_review" и честной низкой confidence.
+6. Срок (dueAt): только если назван явно ("сегодня вечером", "завтра утром", конкретная дата). Считай от текущего локального времени, указанного во входных данных (время уже с часовым поясом). Формат dueAt — ISO 8601 со смещением. В dueText сохрани исходную фразу. Если срока нет — оба поля null.
+7. evidenceMessageId — ключ [m..] того сообщения, где врач пообещал (create) или отчитался/отменил (complete/cancel). Только реально существующий ключ из переписки ниже.
+8. Отвечай СТРОГО одним JSON-объектом без пояснений, markdown и комментариев:
+{"actions": [{"type": "create", "taskId": null, "title": string, "description": string|null, "status": "open|needs_review", "dueAt": string|null, "dueText": string|null, "evidenceMessageId": "m34"|null, "confidence": 0..1}, {"type": "complete|cancel", "taskId": "t12", "title": string, "description": string|null, "evidenceMessageId": "m34"|null, "confidence": 0..1}]}
+Пустой результат: {"actions": []}. (status только для create; по умолчанию "open").`;
 
 function formatMessage(
   m: ConversationInput['messages'][number],
-  idx: number,
+  timezone: string,
 ): string {
-  const who = m.direction === 'outgoing' ? 'ВРАЧ' : `СОБЕСЕДНИК${m.senderName ? ` (${m.senderName})` : ''}`;
-  const time = new Date(m.timestamp).toISOString();
-  const body = m.text ?? `[${m.messageType}, без текста]`;
-  return `${idx + 1}. [${time}] ${who}: ${body}`;
+  // Автор всегда подписан именем (шаг 4.4): в группах реплики разных людей
+  // различимы, а не «СОБЕСЕДНИК» для всех.
+  const who =
+    m.direction === 'outgoing' ? `ВРАЧ${m.senderName ? ` (${m.senderName})` : ''}` : (m.senderName ?? 'Собеседник');
+  const time = formatLocal(m.timestamp, timezone);
+  const body = messageBody(m);
+  return `[${msgKey(m.id)}] [${time}] ${who}: ${body}`;
+}
+
+/** Текст или честный плейсхолдер типа (шаг 4.5: голосовые — с длительностью). */
+function messageBody(m: ConversationInput['messages'][number]): string {
+  if (m.text && m.text.length > 0) return m.text;
+  if (m.messageType === 'voice') {
+    return m.durationSec !== null && m.durationSec !== undefined
+      ? `[голосовое сообщение, ${m.durationSec} сек]`
+      : '[голосовое сообщение]';
+  }
+  return `[${m.messageType}, без текста]`;
 }
 
 /** Строит user-часть промпта из контекста переписки одного чата. */
-export function buildUserPrompt(input: ConversationInput): string {
-  const lines = input.messages.map(formatMessage);
+export function buildUserPrompt(input: ConversationInput, timezone: string): string {
+  const lines = input.messages.map((m) => formatMessage(m, timezone));
   const known =
     input.existingTasks.length > 0
-      ? input.existingTasks.map((t) => `- [${t.id}] "${t.title}" (${t.status})`).join('\n')
+      ? input.existingTasks
+          .map((t) => `- [${taskKey(t.id)}] "${t.title}" (${t.status})`)
+          .join('\n')
       : '(нет известных открытых задач)';
   return [
-    `Текущее время: ${new Date(input.analyzedAt).toISOString()}`,
+    `Текущее время: ${formatLocal(input.analyzedAt, timezone)}`,
     `Чат: ${input.chatJid}${input.contactName ? ` (${input.contactName})` : ''}`,
     '',
-    'Известные открытые задачи этого чата:',
+    'Известные открытые задачи этого чата (ссылайся taskId вида "t12"):',
     known,
     '',
-    'Переписка (по порядку):',
+    'Переписка (по порядку, у каждого сообщения ключ вида [m34]):',
     ...lines,
     '',
     'Верни JSON.',
@@ -58,6 +76,6 @@ export function buildUserPrompt(input: ConversationInput): string {
 }
 
 /** Полный промпт для chat-style провайдеров. */
-export function buildPrompt(input: ConversationInput): { system: string; user: string } {
-  return { system: SYSTEM_PROMPT, user: buildUserPrompt(input) };
+export function buildPrompt(input: ConversationInput, timezone: string): { system: string; user: string } {
+  return { system: SYSTEM_PROMPT, user: buildUserPrompt(input, timezone) };
 }
