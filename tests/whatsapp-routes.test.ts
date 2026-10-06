@@ -31,7 +31,7 @@ function stubController(over: Partial<StatusSnapshot> = {}): WhatsAppController 
     },
     logout: async () => {
       calls.push('logout');
-      return mapped({ ...snap, status: 'logged_out', phone: null });
+      return { status: mapped({ ...snap, status: 'logged_out', phone: null }), serverRevoked: true };
     },
   };
 }
@@ -41,7 +41,8 @@ const qrPng = async (s: string | null): Promise<string | null> =>
 
 async function buildApp(ctrl: WhatsAppController) {
   const app = Fastify();
-  await whatsappRoutes(app, ctrl, qrPng);
+  const { SseHub } = await import('../src/server/sse.js');
+  await whatsappRoutes(app, ctrl, qrPng, new SseHub());
   return app;
 }
 

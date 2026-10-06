@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import type { QrEvent } from '../../whatsapp/manager.js';
+import type { LogoutResult, QrEvent } from '../../whatsapp/manager.js';
+import type { SseHub } from '../sse.js';
 import type { StatusSnapshot, WaStatus } from '../../whatsapp/status-store.js';
 
 /**
@@ -14,7 +15,7 @@ export type WhatsAppController = {
   on(event: 'qr' | 'status', cb: (data: QrEvent | StatusSnapshot) => void): () => void;
   disconnect(): StatusSnapshot;
   connect(): Promise<StatusSnapshot>;
-  logout(): Promise<StatusSnapshot>;
+  logout(): Promise<LogoutResult>;
 };
 
 /** Состояния наружу (шаг 5): qr_pending→qr, connected→open, disconnected→closed. */
@@ -75,6 +76,7 @@ export async function whatsappRoutes(
   app: FastifyInstance,
   ctrl: WhatsAppController,
   qrPng: QrRenderer,
+  sseHub: SseHub,
 ): Promise<void> {
   const sendStatus = (s: StatusSnapshot) => StatusSchema.safeParse(publicStatus(s));
 
@@ -116,6 +118,7 @@ export async function whatsappRoutes(
     send('snapshot', publicStatus(ctrl.snapshot()));
     const offQr = ctrl.on('qr', (d) => send('qr', d));
     const offStatus = ctrl.on('status', (d) => send('status', publicStatus(d as StatusSnapshot)));
+    const release = sseHub.add(reply.raw);
     const hb = setInterval(() => {
       try {
         reply.raw.write(': ping\n\n');
@@ -127,6 +130,7 @@ export async function whatsappRoutes(
       clearInterval(hb);
       offQr();
       offStatus();
+      release();
     });
   });
 
@@ -146,16 +150,20 @@ export async function whatsappRoutes(
     return reply.send(parsed.data);
   });
 
-  // Полный выход: закрыть соединение + стереть auth-сессию. Требует confirm.
+  // Полный выход: отозвать сессию на сервере, закрыть соединение,
+  // стереть auth-сессию. Требует confirm. serverRevoked=false означает,
+  // что sock.logout() не удался (например, нет сети) — локальная сессия
+  // при этом всё равно стёрта.
   app.post('/api/whatsapp/logout', async (req, reply) => {
     const body = LogoutSchema.safeParse(req.body);
     if (!body.success) {
       return reply.code(400).send({ error: 'нужно тело {"confirm": true}' });
     }
-    const parsed = sendStatus(await ctrl.logout());
+    const { status, serverRevoked } = await ctrl.logout();
+    const parsed = sendStatus(status);
     if (!parsed.success) {
       return reply.code(500).send({ error: 'internal contract violation' });
     }
-    return reply.send(parsed.data);
+    return reply.send({ ...parsed.data, serverRevoked });
   });
 }

@@ -1,10 +1,10 @@
 import { useEffect, useState } from 'react';
-import { UnauthorizedError, api, formatDue, type Dashboard, type Task } from '../api';
+import { UnauthorizedError, api, formatDue, loadServerInfo, type Attention, type Dashboard } from '../api';
 
 export default function DashboardPage() {
   const [dash, setDash] = useState<Dashboard | null>(null);
   const [status, setStatus] = useState<string>('…');
-  const [attention, setAttention] = useState<Task[]>([]);
+  const [attention, setAttention] = useState<Attention | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<string | null>(null);
   const [previewBusy, setPreviewBusy] = useState(false);
@@ -14,20 +14,13 @@ export default function DashboardPage() {
   useEffect(() => {
     (async () => {
       try {
-        const [d, s, tasks] = await Promise.all([api.dashboard(), api.waStatus(), api.tasks()]);
+        await loadServerInfo();
+        const [d, s, a] = await Promise.all([api.dashboard(), api.waStatus(), api.attention()]);
         setDash(d);
         setStatus(s.state);
-        const open = tasks.filter((t) => t.status === 'open' || t.status === 'needs_review');
-        const todayStart = new Date();
-        todayStart.setHours(0, 0, 0, 0);
-        const att = open.filter(
-          (t) => t.status === 'needs_review' || (t.dueAt !== null && t.dueAt <= Date.now()),
-        );
-        const rest = open.filter((t) => !att.includes(t));
-        const done = tasks.filter((t) => t.status === 'done');
-        setAttention([...att, ...rest.slice(0, 5), ...done.slice(0, 3)]);
+        setAttention(a);
       } catch (e) {
-        if (e instanceof UnauthorizedError) window.location.hash = '#/login';
+        if (e instanceof UnauthorizedError) return; // редирект уже выполнен в api.ts
         else setError(e instanceof Error ? e.message : 'ошибка');
       }
     })();
@@ -59,14 +52,48 @@ export default function DashboardPage() {
           </div>
         ))}
       </div>
-      {attention.length > 0 && (
+      {attention && attention.overdue.length > 0 && (
         <div className="space-y-2">
-          <h2 className="font-medium">🔴 Нужно внимание</h2>
-          {attention.map((t) => (
+          <h2 className="font-medium">🔴 Просрочено</h2>
+          {attention.overdue.map((t) => (
             <div key={t.id} className="rounded-xl bg-white p-3 shadow-sm">
               <div className="text-sm font-medium text-slate-800">{t.contactName}</div>
               <div>{t.title}</div>
               <div className="text-xs text-slate-500">Срок: {formatDue(t)}</div>
+            </div>
+          ))}
+        </div>
+      )}
+      {attention && attention.upcoming.length > 0 && (
+        <div className="space-y-2">
+          <h2 className="font-medium">🟡 Нужно сделать</h2>
+          {attention.upcoming.map((t) => (
+            <div key={t.id} className="rounded-xl bg-white p-3 shadow-sm">
+              <div className="text-sm font-medium text-slate-800">{t.contactName}</div>
+              <div>{t.title}</div>
+              <div className="text-xs text-slate-500">Срок: {formatDue(t)}</div>
+            </div>
+          ))}
+        </div>
+      )}
+      {attention && attention.doneToday.length > 0 && (
+        <div className="space-y-2">
+          <h2 className="font-medium">✅ Выполнено сегодня</h2>
+          {attention.doneToday.map((t) => (
+            <div key={t.id} className="rounded-xl bg-white p-3 shadow-sm">
+              <div className="text-sm font-medium text-slate-800">{t.contactName}</div>
+              <div>{t.title}</div>
+            </div>
+          ))}
+        </div>
+      )}
+      {attention && attention.needsReview.length > 0 && (
+        <div className="space-y-2">
+          <h2 className="font-medium">❓ Проверьте</h2>
+          {attention.needsReview.map((t) => (
+            <div key={t.id} className="rounded-xl bg-white p-3 shadow-sm">
+              <div className="text-sm font-medium text-slate-800">{t.contactName}</div>
+              <div>{t.title}</div>
             </div>
           ))}
         </div>
@@ -78,7 +105,7 @@ export default function DashboardPage() {
             disabled={previewBusy}
             onClick={() => {
               setPreviewBusy(true);
-              api.digestPreview().then((p) => setPreview(p.content)).catch((e) => setError(e instanceof Error ? e.message : 'ошибка')).finally(() => setPreviewBusy(false));
+              api.digestPreview().then((p) => setPreview(p.content)).catch((e) => { if (!(e instanceof UnauthorizedError)) setError(e instanceof Error ? e.message : 'ошибка'); }).finally(() => setPreviewBusy(false));
             }}
             className="rounded-lg bg-slate-200 px-3 py-1.5 text-sm text-slate-700 disabled:opacity-50"
           >
@@ -92,7 +119,7 @@ export default function DashboardPage() {
               setSendResult(null);
               api.digestSendNow()
                 .then((r) => setSendResult(r.sent ? 'Отправлено ✓' : `Не отправлено: ${r.reason}`))
-                .catch((e) => setSendResult(`Ошибка: ${e instanceof Error ? e.message : e}`))
+                .catch((e) => { if (!(e instanceof UnauthorizedError)) setSendResult(`Ошибка: ${e instanceof Error ? e.message : e}`); })
                 .finally(() => setSendBusy(false));
             }}
             className="rounded-lg bg-slate-900 px-3 py-1.5 text-sm text-white disabled:opacity-50"

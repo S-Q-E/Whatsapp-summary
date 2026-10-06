@@ -37,7 +37,7 @@ export default function WhatsApp() {
       setStatus(await fn());
       await load();
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'ошибка');
+      if (!(e instanceof UnauthorizedError)) setError(e instanceof Error ? e.message : 'ошибка');
     } finally {
       setBusy(false);
     }

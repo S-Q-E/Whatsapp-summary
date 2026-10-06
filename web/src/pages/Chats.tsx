@@ -33,7 +33,7 @@ export default function Chats() {
       await api.setChatIgnored(c.id, c.ignored === 1 ? 0 : 1);
       await load();
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'ошибка');
+      if (!(e instanceof UnauthorizedError)) setError(e instanceof Error ? e.message : 'ошибка');
     }
   };
 

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { UnauthorizedError, api, formatDue, type Task } from '../api';
+import { UnauthorizedError, api, formatDue, loadServerInfo, type Task } from '../api';
 
 const STATUS_LABEL: Record<string, string> = {
   open: 'открыта',
@@ -22,7 +22,7 @@ function TaskCard({ task, onChanged }: { task: Task; onChanged: () => void }) {
       await fn();
       onChanged();
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'ошибка');
+      if (!(e instanceof UnauthorizedError)) setError(e instanceof Error ? e.message : 'ошибка');
     } finally {
       setBusy(false);
     }
@@ -40,7 +40,7 @@ function TaskCard({ task, onChanged }: { task: Task; onChanged: () => void }) {
       const c = await api.taskContext(task.id);
       setContext(c);
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'ошибка');
+      if (!(e instanceof UnauthorizedError)) setError(e instanceof Error ? e.message : 'ошибка');
       setOpen(false);
     } finally {
       setLoadingCtx(false);
@@ -50,12 +50,21 @@ function TaskCard({ task, onChanged }: { task: Task; onChanged: () => void }) {
   const postpone = () => {
     const v = window.prompt('Новый срок (ГГГГ-ММ-ДД, пусто — без срока):', '');
     if (v === null) return;
-    const dueAt = v.trim() === '' ? null : new Date(`${v}T12:00:00`).toISOString();
-    if (v.trim() !== '' && Number.isNaN(Date.parse(dueAt as string))) {
-      setError('плохая дата');
+    const trimmed = v.trim();
+    if (trimmed === '') {
+      void act(() => api.patchTask(task.id, { dueAt: null }));
       return;
     }
-    void act(() => api.patchTask(task.id, { dueAt }));
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+      setError('плохая дата: нужен формат ГГГГ-ММ-ДД, например 2026-10-20');
+      return;
+    }
+    const ms = Date.parse(`${trimmed}T12:00:00`);
+    if (Number.isNaN(ms)) {
+      setError('плохая дата: такого дня нет в календаре');
+      return;
+    }
+    void act(() => api.patchTask(task.id, { dueAt: new Date(ms).toISOString() }));
   };
 
   return (
@@ -113,39 +122,72 @@ function TaskCard({ task, onChanged }: { task: Task; onChanged: () => void }) {
 
 export default function Tasks() {
   const [filter, setFilter] = useState<string>('');
-  const [tasks, setTasks] = useState<Task[] | null>(null);
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [cursor, setCursor] = useState<string | null>(null);
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [newTitle, setNewTitle] = useState('');
-  const [newChat, setNewChat] = useState('');
+  const [newChatId, setNewChatId] = useState('');
+  const [chats, setChats] = useState<{ id: number; jid: string; displayName: string | null; isGroup: number }[]>([]);
 
-  const load = async () => {
+  const load = async (appendCursor?: string | null) => {
     try {
-      setTasks(await api.tasks(filter || undefined));
+      const page = await api.tasks(filter || undefined, 50, appendCursor ?? undefined);
+      setTasks((prev) => (appendCursor ? [...prev, ...page.items] : page.items));
+      setCursor(page.nextCursor);
+      setHasMore(page.nextCursor !== null);
+      setLoaded(true);
     } catch (e) {
-      if (e instanceof UnauthorizedError) window.location.hash = '#/login';
-      else setError(e instanceof Error ? e.message : 'ошибка');
+      if (!(e instanceof UnauthorizedError)) setError(e instanceof Error ? e.message : 'ошибка');
     }
   };
 
+  const reload = () => {
+    setCursor(null);
+    setHasMore(false);
+    setLoaded(false);
+    return load(null);
+  };
+
   useEffect(() => {
-    void load();
+    void loadServerInfo();
+    void (async () => {
+      try {
+        setChats(await api.chats());
+      } catch {
+        // список чатов для селекта — необязателен, форма переживёт
+      }
+    })();
+    void reload();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filter]);
 
   const create = async () => {
-    if (!newTitle.trim() || !newChat.trim()) return;
+    if (!newTitle.trim() || !newChatId) return;
     try {
-      await api.createTask({ chatJid: newChat.trim(), title: newTitle.trim() });
+      await api.createTask({ chatId: Number(newChatId), title: newTitle.trim() });
       setNewTitle('');
-      setNewChat('');
-      await load();
+      setNewChatId('');
+      await reload();
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'ошибка');
+      if (!(e instanceof UnauthorizedError)) setError(e instanceof Error ? e.message : 'ошибка');
+    }
+  };
+
+  const loadMore = async () => {
+    if (!hasMore || loadingMore) return;
+    setLoadingMore(true);
+    try {
+      await load(cursor);
+    } finally {
+      setLoadingMore(false);
     }
   };
 
   if (error) return <div className="p-4 text-red-600">Ошибка: {error}</div>;
-  if (!tasks) return <div className="p-4 text-slate-500">Загрузка задач…</div>;
+  if (!loaded) return <div className="p-4 text-slate-500">Загрузка задач…</div>;
 
   return (
     <div className="mx-auto max-w-2xl space-y-3 p-4">
@@ -162,14 +204,27 @@ export default function Tasks() {
       </div>
       <div className="rounded-xl bg-white p-4 shadow-sm">
         <div className="mb-2 text-sm font-medium">Новая задача вручную</div>
-        <input value={newChat} onChange={(e) => setNewChat(e.target.value)} placeholder="JID чата (…@s.whatsapp.net)" className="mb-2 w-full rounded-lg border border-slate-200 p-2 text-sm" />
+        <select value={newChatId} onChange={(e) => setNewChatId(e.target.value)} className="mb-2 w-full rounded-lg border border-slate-200 bg-white p-2 text-sm">
+          <option value="">— выберите чат —</option>
+          {chats.map((c) => (
+            <option key={c.id} value={c.id}>
+              {c.displayName ?? c.jid}
+              {c.isGroup === 1 ? ' 👥' : ''} · {c.messageCount} сообщ.
+            </option>
+          ))}
+        </select>
         <input value={newTitle} onChange={(e) => setNewTitle(e.target.value)} placeholder="Формулировка задачи" className="mb-2 w-full rounded-lg border border-slate-200 p-2 text-sm" />
-        <button onClick={() => void create()} className="rounded-lg bg-slate-900 px-3 py-1.5 text-sm text-white">Создать</button>
+        <button onClick={() => void create()} disabled={!newTitle.trim() || !newChatId} className="rounded-lg bg-slate-900 px-3 py-1.5 text-sm text-white disabled:opacity-50">Создать</button>
       </div>
       {tasks.length === 0 && <div className="text-slate-500">Задач нет.</div>}
       {tasks.map((t) => (
-        <TaskCard key={t.id} task={t} onChanged={() => void load()} />
+        <TaskCard key={t.id} task={t} onChanged={() => void reload()} />
       ))}
+      {hasMore && (
+        <button onClick={() => void loadMore()} disabled={loadingMore} className="w-full rounded-xl bg-white p-3 text-sm text-slate-700 shadow-sm disabled:opacity-50">
+          {loadingMore ? 'Загрузка…' : 'Показать ещё'}
+        </button>
+      )}
     </div>
   );
 }

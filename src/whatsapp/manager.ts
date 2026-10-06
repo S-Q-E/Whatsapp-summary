@@ -12,6 +12,22 @@ export type ManagerEvent = 'qr' | 'status';
 
 export type QrEvent = { qr: string; updatedAt: number };
 
+export type LogoutResult = { status: StatusSnapshot; serverRevoked: boolean };
+
+/**
+ * Отзыв сессии на стороне WhatsApp (шаг 6, п.2): sock.logout() разрывает
+ * связь устройство-сервер. Никогда не бросает — при ошибке сети
+ * возвращается false, и вызывающий стирает локальную сессию всё равно.
+ */
+export async function tryRevokeSession(sock: { logout(): Promise<unknown> }): Promise<boolean> {
+  try {
+    await sock.logout();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * WhatsAppManager — владелец Baileys-соединения в серверном режиме.
  * Композиция над проверенным startWhatsAppClient: сам сокет, переподключения
@@ -133,12 +149,16 @@ export class WhatsAppManager {
   }
 
   /**
-   * Полный logout (шаг 5, POST /api/whatsapp/logout): закрыть соединение
-   * и стереть локальную auth-сессию. Следующий connect покажет новый QR.
+   * Полный logout (шаг 5, POST /api/whatsapp/logout): сначала отзываем сессию
+   * на стороне WhatsApp через sock.logout(), затем закрываем соединение
+   * и стираем локальную auth-сессию. При ошибке logout() локальная сессия
+   * стирается всё равно, а в ответе serverRevoked=false. Следующий connect
+   * покажет новый QR.
    */
-  async logout(): Promise<StatusSnapshot> {
+  async logout(): Promise<LogoutResult> {
     this.manualStop = true;
     this.qrStore.clear();
+    const serverRevoked = this.client ? await tryRevokeSession(this.client.sock) : false;
     try {
       this.client?.stop('manual logout via API');
     } catch {
@@ -148,7 +168,7 @@ export class WhatsAppManager {
     this.wipeAuth();
     this.statusStore.onLoggedOut();
     this.emitStatus();
-    return this.snapshot();
+    return { status: this.snapshot(), serverRevoked };
   }
 
   /** Переподключить после ручного disconnect или logged_out (после wipe — новый QR). */

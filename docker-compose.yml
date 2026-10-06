@@ -11,6 +11,9 @@ services:
       # libc-часовой пояс контейнера = TIMEZONE из .env (подстановка compose);
       # default совпадает с дефолтом приложения.
       TZ: ${TIMEZONE:-Asia/Almaty}
+      # Внутри compose-сети сервер слушает все интерфейсы контейнера;
+      # наружу порт публикуется только на 127.0.0.1 хоста (см. ports ниже).
+      WEB_HOST: 0.0.0.0
     volumes:
       - ./data:/app/data
     ports:

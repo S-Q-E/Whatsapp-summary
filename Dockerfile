@@ -22,15 +22,18 @@ COPY src/ ./src/
 RUN npm run build
 
 # --- 3. Рантайм ---
+# Только продакшен-зависимости + непривилегированный пользователь.
+# /app/data — том с хоста: chown делает файлы доступными пользователю node.
 FROM node:20-alpine AS runtime
 ENV NODE_ENV=production
 WORKDIR /app
 COPY package.json package-lock.json ./
-COPY --from=api-builder /build/node_modules ./node_modules
+RUN npm ci --omit=dev
 COPY --from=api-builder /build/dist ./dist
 COPY --from=api-builder /build/drizzle ./drizzle
 COPY --from=web-builder /build/web/dist ./web/dist
-RUN mkdir -p /app/data
+RUN mkdir -p /app/data && chown -R node:node /app
+USER node
 VOLUME ["/app/data"]
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \

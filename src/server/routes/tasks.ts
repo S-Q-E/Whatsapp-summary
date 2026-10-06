@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify';
-import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, lte, type SQL } from 'drizzle-orm';
+import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, lt, lte, or, sql, type SQL } from 'drizzle-orm';
 import { z } from 'zod';
 import type { Db } from '../../database/db.js';
 import { chats, messages, tasks } from '../../database/schema.js';
@@ -30,7 +30,30 @@ const TaskShape = z.object({
 
 type TaskRow = z.infer<typeof TaskShape>;
 
-async function taskList(db: Db, where?: SQL | undefined): Promise<TaskRow[]> {
+/** Ранг статуса для сортировки «открытые сначала». */
+function statusRank() {
+  return sql<number>`CASE ${tasks.status} WHEN 'open' THEN 0 WHEN 'needs_review' THEN 1 WHEN 'done' THEN 2 ELSE 3 END`;
+}
+
+const CursorSchema = z
+  .string()
+  .regex(/^[0-3]:\d+$/, { error: 'cursor: формат "rank:id"' });
+
+async function taskList(
+  db: Db,
+  where?: SQL | undefined,
+  opts: { limit?: number; cursor?: string } = {},
+): Promise<{ items: TaskRow[]; nextCursor: string | null }> {
+  const limit = Math.min(Math.max(opts.limit ?? 50, 1), 200);
+  const rank = statusRank();
+  const conds: SQL[] = [];
+  if (where) conds.push(where);
+  if (opts.cursor !== undefined) {
+    const parsed = CursorSchema.safeParse(opts.cursor);
+    if (!parsed.success) throw new Error('cursor: формат "rank:id"');
+    const [r, lastId] = parsed.data.split(':').map(Number);
+    conds.push(sql`(${rank} > ${r} OR (${rank} = ${r} AND ${tasks.id} < ${lastId}))`);
+  }
   const rows = await db
     .select({
       id: tasks.id,
@@ -51,13 +74,32 @@ async function taskList(db: Db, where?: SQL | undefined): Promise<TaskRow[]> {
     })
     .from(tasks)
     .leftJoin(chats, eq(tasks.chatId, chats.id))
-    .where(where)
-    .orderBy(desc(tasks.updatedAt))
-    .limit(200);
-  return rows.map((r) => ({
+    .where(conds.length > 0 ? and(...conds) : undefined)
+    .orderBy(rank, desc(tasks.id))
+    .limit(limit + 1);
+  const page = rows.slice(0, limit);
+  const items = page.map((r) => ({
     ...r,
     contactName: r.contactName ?? r.chatJid,
   }));
+  const nextCursor =
+    rows.length > limit
+      ? `${statusRankOf(items[items.length - 1]!.status)}:${items[items.length - 1]!.id}`
+      : null;
+  return { items, nextCursor };
+}
+
+function statusRankOf(status: string): number {
+  switch (status) {
+    case 'open':
+      return 0;
+    case 'needs_review':
+      return 1;
+    case 'done':
+      return 2;
+    default:
+      return 3;
+  }
 }
 
 const PatchSchema = z.object({
@@ -95,32 +137,67 @@ const MsgShape = z.object({
 });
 
 export async function dashboardRoutes(app: FastifyInstance, db: Db): Promise<void> {
-  // Счётчики за локальный день (TIMEZONE).
+  // Счётчики за локальный день (TIMEZONE) — через COUNT, без загрузки строк.
   app.get('/api/dashboard', async () => {
     const { start, end } = dayBounds(new Date());
-    const msgRows = await db
-      .select({ timestamp: messages.timestamp })
-      .from(messages)
-      .where(and(gte(messages.timestamp, start), lt(messages.timestamp, end)));
-    const openRows = await db
-      .select({ id: tasks.id, status: tasks.status, dueAt: tasks.dueAt, closedAt: tasks.closedAt })
-      .from(tasks)
-      .where(inArray(tasks.status, ['open', 'needs_review', 'done']));
-    const open = openRows.filter((t) => t.status === 'open' || t.status === 'needs_review');
+    const count = async (where: SQL | undefined): Promise<number> => {
+      const q = db.select({ n: sql<number>`count(*)` }).from(tasks);
+      const rows = where === undefined ? await q : await q.where(where);
+      return rows[0]?.n ?? 0;
+    };
+    const [msgRows, openTasks, overdueTasks, doneToday, needsReview, activeTasks] = await Promise.all([
+      db
+        .select({ n: sql<number>`count(*)` })
+        .from(messages)
+        .where(and(gte(messages.timestamp, start), lt(messages.timestamp, end))),
+      count(eq(tasks.status, 'open')),
+      count(and(eq(tasks.status, 'open'), lt(tasks.dueAt, start), isNotNull(tasks.dueAt))),
+      count(and(eq(tasks.status, 'done'), gte(tasks.closedAt, start), lt(tasks.closedAt, end))),
+      count(eq(tasks.status, 'needs_review')),
+      count(inArray(tasks.status, ['open', 'needs_review'])),
+    ]);
     return {
-      messagesToday: msgRows.length,
-      openTasks: openRows.filter((t) => t.status === 'open').length,
-      overdueTasks: openRows.filter((t) => t.status === 'open' && t.dueAt !== null && t.dueAt < start).length,
-      doneToday: openRows.filter(
-        (t) => t.status === 'done' && t.closedAt !== null && t.closedAt >= start && t.closedAt < end,
-      ).length,
-      needsReview: openRows.filter((t) => t.status === 'needs_review').length,
-      activeTasks: open.length,
+      messagesToday: msgRows[0]?.n ?? 0,
+      openTasks,
+      overdueTasks,
+      doneToday,
+      needsReview,
+      activeTasks,
     };
   });
 
+  // «Нужно внимание» считается на бэкенде общей функцией с дайджестом:
+  // 🔴 просроченные (open, срок прошёл), 🟡 предстоящие открытые,
+  // ✅ выполненные сегодня, ❓ на проверке. done сюда не попадает никогда.
+  app.get('/api/dashboard/attention', async (_req, reply) => {
+    const { start, end } = dayBounds(new Date());
+    const listed = async (where: SQL | undefined) =>
+      (await taskList(db, where, { limit: 50 })).items;
+    const [overdue, upcoming, doneToday, needsReview] = await Promise.all([
+      listed(and(eq(tasks.status, 'open'), isNotNull(tasks.dueAt), lt(tasks.dueAt, start))),
+      listed(
+        and(
+          eq(tasks.status, 'open'),
+          or(isNull(tasks.dueAt), gte(tasks.dueAt, start)),
+        ),
+      ),
+      listed(and(eq(tasks.status, 'done'), gte(tasks.closedAt, start), lt(tasks.closedAt, end))),
+      listed(eq(tasks.status, 'needs_review')),
+    ]);
+    const parsed = z
+      .object({
+        overdue: z.array(TaskShape),
+        upcoming: z.array(TaskShape),
+        doneToday: z.array(TaskShape),
+        needsReview: z.array(TaskShape),
+      })
+      .safeParse({ overdue, upcoming, doneToday, needsReview });
+    if (!parsed.success) return reply.code(500).send({ error: 'internal contract violation' });
+    return reply.send(parsed.data);
+  });
+
   app.get('/api/tasks', async (req, reply) => {
-    const q = req.query as { status?: string; chatId?: string };
+    const q = req.query as { status?: string; chatId?: string; limit?: string; cursor?: string };
     const conds: SQL[] = [];
     if (q.status !== undefined) {
       const parsed = StatusFilter.safeParse(q.status);
@@ -132,10 +209,29 @@ export async function dashboardRoutes(app: FastifyInstance, db: Db): Promise<voi
       if (!Number.isInteger(id) || id <= 0) return reply.code(400).send({ error: 'chatId: положительное целое' });
       conds.push(eq(tasks.chatId, id));
     }
-    const list = await taskList(db, conds.length > 0 ? and(...conds) : undefined);
-    const parsed = z.array(TaskShape).safeParse(list);
-    if (!parsed.success) return reply.code(500).send({ error: 'internal contract violation' });
-    return reply.send(parsed.data);
+    let limit: number | undefined;
+    if (q.limit !== undefined) {
+      limit = Number(q.limit);
+      if (!Number.isInteger(limit) || limit <= 0 || limit > 200) {
+        return reply.code(400).send({ error: 'limit: целое 1..200' });
+      }
+    }
+    try {
+      const page = await taskList(db, conds.length > 0 ? and(...conds) : undefined, {
+        limit,
+        cursor: q.cursor,
+      });
+      const parsed = z
+        .object({ items: z.array(TaskShape), nextCursor: z.string().nullable() })
+        .safeParse(page);
+      if (!parsed.success) return reply.code(500).send({ error: 'internal contract violation' });
+      return reply.send(parsed.data);
+    } catch (err) {
+      if (err instanceof Error && err.message.startsWith('cursor:')) {
+        return reply.code(400).send({ error: err.message });
+      }
+      throw err;
+    }
   });
 
   app.post('/api/tasks', async (req, reply) => {
@@ -169,7 +265,7 @@ export async function dashboardRoutes(app: FastifyInstance, db: Db): Promise<voi
       })
       .returning({ id: tasks.id });
     const created = await taskList(db, eq(tasks.id, inserted[0]!.id));
-    return reply.code(201).send(created[0]);
+    return reply.code(201).send(created.items[0]);
   });
 
   app.patch('/api/tasks/:id', async (req, reply) => {
@@ -198,7 +294,7 @@ export async function dashboardRoutes(app: FastifyInstance, db: Db): Promise<voi
     }
     await db.update(tasks).set(patch).where(eq(tasks.id, id));
     const updated = await taskList(db, eq(tasks.id, id));
-    return reply.send(updated[0]);
+    return reply.send(updated.items[0]);
   });
 
   app.get('/api/tasks/:id/context', async (req, reply) => {

@@ -15,6 +15,7 @@ import { QrPng } from './server/qr.js';
 import { whatsappRoutes, type WhatsAppController } from './server/routes/whatsapp.js';
 import { dashboardRoutes } from './server/routes/tasks.js';
 import { chatsRoutes } from './server/routes/chats.js';
+import { SseHub } from './server/sse.js';
 import { digestRoutes } from './server/routes/digest.js';
 import { DigestScheduler, DigestService } from './digest/service.js';
 import { WhatsAppManager } from './whatsapp/manager.js';
@@ -22,6 +23,8 @@ import type { Logger } from 'pino';
 
 /** WA-клиент, нужный приложению. WhatsAppManager покрывает полностью. */
 export type AppWaClient = WhatsAppController;
+
+export type AppInstance = FastifyInstance & { sseHub: SseHub };
 
 export type AppScheduler = {
   metricsSnapshot(): ReturnType<AnalyzeScheduler['metricsSnapshot']>;
@@ -55,7 +58,7 @@ export type AppOptions = {
  * WhatsApp API, system/status. Без listen и без side-эффектов —
  * поэтому покрывается inject-тестами с моками.
  */
-export async function createApp(opts: AppOptions): Promise<FastifyInstance> {
+export async function createApp(opts: AppOptions): Promise<AppInstance> {
   const app = Fastify({
     loggerInstance: opts.log as unknown as FastifyBaseLogger,
     trustProxy: opts.trustProxy ?? false,
@@ -93,7 +96,8 @@ export async function createApp(opts: AppOptions): Promise<FastifyInstance> {
       .send({ ok: true });
   });
 
-  await whatsappRoutes(app, opts.wa, opts.qrPng);
+  const sseHub = new SseHub();
+  await whatsappRoutes(app, opts.wa, opts.qrPng, sseHub);
   await dashboardRoutes(app, opts.db);
   await chatsRoutes(app, opts.db);
   if (opts.digest) {
@@ -120,9 +124,12 @@ export async function createApp(opts: AppOptions): Promise<FastifyInstance> {
     analyze: opts.scheduler.metricsSnapshot(),
     unprocessedMessages: countUnprocessed(opts.db),
     chatsNeedingAttention: chatsNeedingAttention(opts.db),
+    timezone: env.timezone,
   }));
 
-  return app;
+  const typed = app as unknown as AppInstance;
+  typed.sseHub = sseHub;
+  return typed;
 }
 
 /**
@@ -186,6 +193,8 @@ export async function runApp(): Promise<{ app: FastifyInstance; stop: () => Prom
     scheduler.stop();
     digestScheduler.stop();
     wa.stop();
+    // Сначала завершаем висящие SSE-ответы — иначе app.close() висит на открытых сокетах.
+    app.sseHub.closeAll();
     try {
       await app.close();
     } catch {

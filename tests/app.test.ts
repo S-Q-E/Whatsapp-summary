@@ -26,7 +26,7 @@ function mockWa(state: WaStatus = 'qr_pending'): AppWaClient & { loggedOut: bool
     connect: async () => stub.snapshot(),
     logout: async () => {
       stub.loggedOut = true;
-      return stub.snapshot();
+      return { status: stub.snapshot(), serverRevoked: true };
     },
     on: () => () => {},
   };
@@ -137,6 +137,7 @@ describe('app API (шаг 5)', () => {
       const ok = await app.inject({ method: 'POST', url: '/api/whatsapp/logout', payload: { confirm: true } });
       assert.equal(ok.statusCode, 200);
       assert.equal(wa.loggedOut, true);
+      assert.equal(ok.json().serverRevoked, true);
       await app.close();
     } finally {
       close();

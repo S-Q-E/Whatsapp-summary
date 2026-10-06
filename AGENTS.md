@@ -8,9 +8,11 @@ WhatsApp («чат с собой»). Это не summarizer: цель — «чт
 
 ## Текущее состояние
 Рабочий MVP: Node 20+, TypeScript ESM, Baileys 7, Drizzle + better-sqlite3,
-провайдеры AI (openrouter/ollama/heuristic/mock), CLI-скрипты analyze/digest,
-36 тестов проходят. Мы НЕ переписываем с нуля, а поэтапно исправляем и
-расширяем. Не удаляй рабочий код без причины, описанной в отчёте.
+Fastify API + SSE, React-дашборд (Vite + Tailwind), Docker (multi-stage),
+провайдеры AI (openrouter/ollama/heuristic/mock), транскрибация голосовых,
+CLI-скрипты analyze/digest/eval, 170+ тестов проходят. Мы НЕ переписываем
+с нуля, а поэтапно исправляем и расширяем. Не удаляй рабочий код без причины,
+описанной в отчёте.
 
 ## Известные проблемы (подлежат исправлению по шагам)
 1. Задачи сопоставляются по тексту названия (includes/equals):

@@ -96,11 +96,11 @@ describe('шаг 6: dashboard API', () => {
       const { chatId } = seedDay(db, dayStart);
       const app = await createApp({ db, log, wa: waStub, scheduler: schedStub, qrPng, auth: { password: '', allowNoAuth: true } });
       const open = await app.inject({ method: 'GET', url: '/api/tasks?status=open' });
-      assert.equal(open.json().length, 3);
-      assert.ok(open.json().every((t: { status: string }) => t.status === 'open'));
-      assert.ok(open.json()[0].contactName === 'Айгуль');
+      assert.equal(open.json().items.length, 3);
+      assert.ok(open.json().items.every((t: { status: string }) => t.status === 'open'));
+      assert.ok(open.json().items[0].contactName === 'Айгуль');
       const byChat = await app.inject({ method: 'GET', url: `/api/tasks?chatId=${chatId}` });
-      assert.equal(byChat.json().length, 5);
+      assert.equal(byChat.json().items.length, 5);
       const bad = await app.inject({ method: 'GET', url: '/api/tasks?status=bogus' });
       assert.equal(bad.statusCode, 400);
       await app.close();
