@@ -136,10 +136,10 @@ const MsgShape = z.object({
   isClosing: z.boolean(),
 });
 
-export async function dashboardRoutes(app: FastifyInstance, db: Db): Promise<void> {
+export async function dashboardRoutes(app: FastifyInstance, db: Db, now: () => number = Date.now): Promise<void> {
   // Счётчики за локальный день (TIMEZONE) — через COUNT, без загрузки строк.
   app.get('/api/dashboard', async () => {
-    const { start, end } = dayBounds(new Date());
+    const { start, end } = dayBounds(new Date(now()));
     const count = async (where: SQL | undefined): Promise<number> => {
       const q = db.select({ n: sql<number>`count(*)` }).from(tasks);
       const rows = where === undefined ? await q : await q.where(where);
@@ -170,7 +170,7 @@ export async function dashboardRoutes(app: FastifyInstance, db: Db): Promise<voi
   // 🔴 просроченные (open, срок прошёл), 🟡 предстоящие открытые,
   // ✅ выполненные сегодня, ❓ на проверке. done сюда не попадает никогда.
   app.get('/api/dashboard/attention', async (_req, reply) => {
-    const { start, end } = dayBounds(new Date());
+    const { start, end } = dayBounds(new Date(now()));
     const listed = async (where: SQL | undefined) =>
       (await taskList(db, where, { limit: 50 })).items;
     const [overdue, upcoming, doneToday, needsReview] = await Promise.all([

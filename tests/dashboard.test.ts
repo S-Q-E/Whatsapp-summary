@@ -74,7 +74,9 @@ describe('шаг 6: dashboard API', () => {
     try {
       const dayStart = startOfDay(new Date('2026-10-06T12:00:00+05:00'), TZ);
       seedDay(db, dayStart);
-      const app = await createApp({ db, log, wa: waStub, scheduler: schedStub, qrPng, auth: { password: '', allowNoAuth: true } });
+      // «Сегодня» зафиксировано внутри засеянного дня — не зависит от реальных часов.
+      const now = () => new Date('2026-10-06T15:00:00+05:00').getTime();
+      const app = await createApp({ db, log, wa: waStub, scheduler: schedStub, qrPng, auth: { password: '', allowNoAuth: true }, now });
       const res = await app.inject({ method: 'GET', url: '/api/dashboard' });
       assert.equal(res.statusCode, 200);
       const b = res.json();

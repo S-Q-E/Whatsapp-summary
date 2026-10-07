@@ -49,6 +49,8 @@ export type AppOptions = {
   };
   /** опущен = routes дайджеста не регистрируются (старые тесты) */
   digest?: DigestService;
+  /** источник времени для dayBounds в дашборде (тесты фиксируют «сегодня»); по умолчанию Date.now */
+  now?: () => number;
   /** проксирует X-Forwarded-Proto/For (только за доверенным proxy) */
   trustProxy?: boolean;
 };
@@ -98,7 +100,7 @@ export async function createApp(opts: AppOptions): Promise<AppInstance> {
 
   const sseHub = new SseHub();
   await whatsappRoutes(app, opts.wa, opts.qrPng, sseHub);
-  await dashboardRoutes(app, opts.db);
+  await dashboardRoutes(app, opts.db, opts.now ?? Date.now);
   await chatsRoutes(app, opts.db);
   if (opts.digest) {
     await digestRoutes(app, opts.digest);
