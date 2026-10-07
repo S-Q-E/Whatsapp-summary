@@ -18,7 +18,8 @@ export class HeuristicProvider implements AIProvider {
   readonly model = 'heuristic-ru-v1';
   readonly promptVersion = 'n/a-heuristic';
 
-  async analyzeConversation(input: ConversationInput): Promise<AnalyzeOutput> {
+  async analyzeConversation(input: ConversationInput, opts?: { signal?: AbortSignal }): Promise<AnalyzeOutput> {
+    opts?.signal?.throwIfAborted();
     const tasks: ExtractedTask[] = [];
     const seen = new Set<string>(); // не дублировать одно обещание дважды
 

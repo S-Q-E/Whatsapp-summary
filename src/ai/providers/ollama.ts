@@ -26,14 +26,17 @@ export class OllamaProvider implements AIProvider {
     this.model = model;
   }
 
-  async analyzeConversation(input: ConversationInput): Promise<AnalyzeOutput> {
+  async analyzeConversation(input: ConversationInput, opts?: { signal?: AbortSignal }): Promise<AnalyzeOutput> {
+    opts?.signal?.throwIfAborted();
     const { system, user } = buildPrompt(input, env.timezone);
     let res: Response;
     try {
       res = await fetch(`${this.baseUrl.replace(/\/$/, '')}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        signal: AbortSignal.timeout(this.timeoutMs),
+        signal: opts?.signal
+          ? AbortSignal.any([AbortSignal.timeout(this.timeoutMs), opts.signal])
+          : AbortSignal.timeout(this.timeoutMs),
         body: JSON.stringify({
           model: this.model,
           stream: false,

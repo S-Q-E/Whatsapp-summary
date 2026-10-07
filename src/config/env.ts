@@ -75,12 +75,22 @@ const envSchema = z.object({
     (v) => (v === '' || v === undefined ? undefined : Number(v)),
     z.number({ error: 'ANALYZE_MAX_CHATS: нужно целое число, например 10' }).int().min(1).max(1000).default(10),
   ),
+  /** Максимум волн анализа на чат за один тик; остаток добирается следующими тиками. */
+  MAX_WAVES_PER_TICK: z.preprocess(
+    (v) => (v === '' || v === undefined ? undefined : Number(v)),
+    z.number({ error: 'MAX_WAVES_PER_TICK: нужно целое число, например 3' }).int().min(1).max(100).default(3),
+  ),
   /** Печатать QR в терминал (standalone ingestion); в серверном режиме QR только в WEB. */
   QR_TERMINAL: optBool(false),
   /** Контекст чата: последние N сообщений за окно (шаг 3). */
   AI_CONTEXT_LIMIT: z.preprocess(
     (v) => (v === '' || v === undefined ? undefined : Number(v)),
     z.number({ error: 'AI_CONTEXT_LIMIT: нужно целое число, например 40' }).int().min(1).max(500).default(40),
+  ),
+  /** Сколько уже разобранных сообщений докладывать в окно как контекст (по умолчанию 15). */
+  AI_CONTEXT_PRIOR: z.preprocess(
+    (v) => (v === '' || v === undefined ? undefined : Number(v)),
+    z.number({ error: 'AI_CONTEXT_PRIOR: нужно целое число, например 15' }).int().min(0).max(100).default(15),
   ),
   AI_CONTEXT_DAYS: z.preprocess(
     (v) => (v === '' || v === undefined ? undefined : Number(v)),
@@ -173,8 +183,10 @@ export const env = {
   aiTimeoutMs: raw.AI_TIMEOUT_MS,
   analyzeIntervalMin: raw.ANALYZE_INTERVAL_MIN,
   analyzeMaxChats: raw.ANALYZE_MAX_CHATS,
+  maxWavesPerTick: raw.MAX_WAVES_PER_TICK,
   qrTerminal: raw.QR_TERMINAL,
   aiContextLimit: raw.AI_CONTEXT_LIMIT,
+  aiContextPrior: raw.AI_CONTEXT_PRIOR,
   aiContextDays: raw.AI_CONTEXT_DAYS,
   analyzeNewChats: raw.ANALYZE_NEW_CHATS,
   allowHeuristicFallback: raw.ALLOW_HEURISTIC_FALLBACK,

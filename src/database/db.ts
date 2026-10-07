@@ -120,10 +120,28 @@ export function runMigrations(
 let sqlite: Database.Database | null = null;
 let db: Db | null = null;
 
+/**
+ * Проверяет, что каталог данных существует и доступен на запись.
+ * В Docker том ./data часто принадлежит root, а рантайм работает
+ * от пользователя node — тогда стартовать бессмысленно: БД не откроется.
+ * Бросает понятную ошибку на русском с готовой командой исправления.
+ */
+export function ensureDataDirWritable(dir: string): void {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.accessSync(dir, fs.constants.W_OK);
+  } catch {
+    throw new Error(
+      `Каталог данных недоступен на запись: ${dir}. ` +
+        `Смените владельца: sudo chown -R 1000:1000 data`,
+    );
+  }
+}
+
 export function openDatabase(log: Logger): Db {
   if (db) return db;
   const file = path.resolve(env.sqlitePath);
-  fs.mkdirSync(path.dirname(file), { recursive: true });
+  ensureDataDirWritable(path.dirname(file));
   sqlite = new Database(file);
   sqlite.pragma('journal_mode = WAL');
   sqlite.pragma('foreign_keys = ON');

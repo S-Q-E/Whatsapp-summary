@@ -377,9 +377,11 @@ export function applyEdit(
 }
 
 /**
- * Применяет удаление: только deleted_at. Текст остаётся в локальной БД
- * (аудит), но в AI-контекст сообщение больше не попадает (фильтр по
- * deleted_at в loadPendingBundles). Неизвестный target — пропуск.
+ * Применяет удаление: ставит deleted_at И сразу зачищает
+ * text/transcript/sender_name (независимо от RETENTION_DAYS — удалённое
+ * не должно лежать в БД открытым текстом). Строка остаётся (аудит связей
+ * source/closed_by), но в AI-контекст сообщение больше не попадает
+ * (фильтр по deleted_at в loadPendingBundles). Неизвестный target — пропуск.
  */
 export function applyRevoke(
   db: Db,
@@ -389,7 +391,8 @@ export function applyRevoke(
   const chatJid = resolveCanonical(db, input.chatJid);
   try {
     const res = db.run(sql`
-      UPDATE messages SET deleted_at = ${input.timestampMs}
+      UPDATE messages SET deleted_at = ${input.timestampMs},
+        text = NULL, transcript = NULL, sender_name = NULL
       WHERE chat_jid = ${chatJid} AND whatsapp_message_id = ${input.targetId}
     `);
     if (Number(res.changes ?? 0) === 0) {

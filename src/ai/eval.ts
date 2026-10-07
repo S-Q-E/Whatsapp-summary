@@ -3,6 +3,8 @@ import type { AnalyzeOutput, ConversationInput, ExistingTaskSummary } from './ty
 
 /** id открытой задачи в eval-input (совпадает с heuristic-тестами). */
 export const EVAL_OPEN_TASK_ID = 41;
+/** id недавно закрытой задачи в eval-input. */
+export const EVAL_CLOSED_TASK_ID = 42;
 
 export type CaseInput = {
   input: ConversationInput;
@@ -23,7 +25,7 @@ export function caseInput(c: EvalCase, analyzedAt: number = EVAL_BASE_TS): CaseI
     direction: (m.from === 'doctor' ? 'outgoing' : 'incoming') as 'incoming' | 'outgoing',
     senderName: m.from === 'doctor' ? null : (m.name ?? 'Собеседник'),
     text: m.text,
-    transcript: null,
+    transcript: m.transcript ?? null,
     messageType: m.messageType ?? 'text',
     durationSec: null,
     timestamp: dayStart + (m.dayOffset ?? 0) * DAY + m.hour * 3_600_000 + m.minute * 60_000,
@@ -32,12 +34,16 @@ export function caseInput(c: EvalCase, analyzedAt: number = EVAL_BASE_TS): CaseI
   const existingTasks: ExistingTaskSummary[] = c.openTask
     ? [{ id: EVAL_OPEN_TASK_ID, title: c.openTask.title, status: 'open' }]
     : [];
+  const recentlyClosed = c.closedTask
+    ? [{ id: EVAL_CLOSED_TASK_ID, title: c.closedTask.title, status: 'done' as const, sourceMessageId: null }]
+    : [];
   return {
     input: {
       chatJid: `${c.id}@eval.test`,
       contactName: c.kind === 'group' ? 'Группа' : 'Пациент',
       messages,
       existingTasks,
+      recentlyClosed,
       analyzedAt,
     },
     msgIndexById: new Map(messages.map((m, i) => [m.id, i] as [number, number])),
@@ -58,6 +64,10 @@ export type ScoredCase = {
   correctCompletes: number;
   correctCancels: number;
   falseActions: number;
+  /** create при закрытой задаче и пустом ожидании (регресс воскрешения) */
+  falseResurrect: number;
+  /** неверные complete/cancel (не совпали с ожидаемыми) */
+  falseClose: number;
   createPrecision: number | null;
   createRecall: number | null;
   needsReviewShare: number | null;
@@ -79,6 +89,7 @@ export function scoreCase(c: EvalCase, out: AnalyzeOutput, ctx: CaseInput): Scor
       actualCompletes: out.tasks.filter((t) => t.action === 'complete').length,
       actualCancels: out.tasks.filter((t) => t.action === 'cancel').length,
       matchedCreates: 0, correctCompletes: 0, correctCancels: 0, falseActions: 0,
+      falseResurrect: 0, falseClose: 0,
       createPrecision: null, createRecall: null, needsReviewShare: null, actualNeedsReview: 0, dueOk: true,
       pass: null, notes: [`известный гэп контракта: ${c.expect.knownGap}`],
     };
@@ -129,6 +140,13 @@ export function scoreCase(c: EvalCase, out: AnalyzeOutput, ctx: CaseInput): Scor
     (t) => t.taskId === EVAL_OPEN_TASK_ID && t.messageId !== null && c.expect.cancels.includes(ctx.msgIndexById.get(t.messageId) ?? -1),
   ).length;
   falseActions += actualCompletes.length - correctCompletes + (actualCancels.length - correctCancels);
+  const falseClose = actualCompletes.length - correctCompletes + (actualCancels.length - correctCancels);
+  // Воскрешение: create в кейсе с закрытой задачей при пустом ожидании creates.
+  // Отдельная метрика (а не только falseActions), т.к. это опаснейший класс ошибок.
+  const falseResurrect =
+    c.closedTask && c.expect.creates.length === 0
+      ? out.tasks.filter((t) => t.action === 'create').length
+      : 0;
 
   const expectedCreates = c.expect.creates.length;
   const precision = actualCreates > 0 ? matched / actualCreates : expectedCreates === 0 ? 1 : 0;
@@ -153,6 +171,7 @@ export function scoreCase(c: EvalCase, out: AnalyzeOutput, ctx: CaseInput): Scor
     expectedCreates, expectedCompletes: c.expect.completes.length, expectedCancels: c.expect.cancels.length,
     actualCreates, actualCompletes: actualCompletes.length, actualCancels: actualCancels.length,
     matchedCreates: matched, correctCompletes, correctCancels, falseActions,
+    falseResurrect, falseClose,
     createPrecision: precision, createRecall: recall, needsReviewShare, actualNeedsReview, dueOk,
     pass, notes,
   };
@@ -168,6 +187,8 @@ export type EvalMetrics = {
   cancelAccuracy: number | null;
   falseTaskRate: number | null;
   needsReviewShare: number | null;
+  falseResurrect: number;
+  falseClose: number;
 };
 
 export function scoreAll(scored: ScoredCase[]): EvalMetrics {
@@ -183,6 +204,8 @@ export function scoreAll(scored: ScoredCase[]): EvalMetrics {
   let totalActual = 0;
   let nrCreates = 0;
   let allCreates = 0;
+  let resurrect = 0;
+  let falseClose = 0;
   for (const s of ev) {
     match += s.matchedCreates;
     act += s.actualCreates;
@@ -195,6 +218,8 @@ export function scoreAll(scored: ScoredCase[]): EvalMetrics {
     totalActual += s.actualCreates + s.actualCompletes + s.actualCancels;
     nrCreates += s.actualNeedsReview;
     allCreates += s.actualCreates;
+    resurrect += s.falseResurrect;
+    falseClose += s.falseClose;
   }
   const needsReviewShare = allCreates > 0 ? nrCreates / allCreates : null;
   return {
@@ -207,6 +232,8 @@ export function scoreAll(scored: ScoredCase[]): EvalMetrics {
     cancelAccuracy: expCancel > 0 ? correctCancel / expCancel : null,
     falseTaskRate: totalActual > 0 ? falseN / totalActual : 0,
     needsReviewShare,
+    falseResurrect: resurrect,
+    falseClose,
   };
 }
 
@@ -227,7 +254,7 @@ export type EvalCompare = {
 };
 
 export function compareEvals(base: EvalResultFile, other: EvalResultFile): EvalCompare {
-  const keys = ['createPrecision', 'createRecall', 'closeAccuracy', 'cancelAccuracy', 'falseTaskRate', 'needsReviewShare'] as const;
+  const keys = ['createPrecision', 'createRecall', 'closeAccuracy', 'cancelAccuracy', 'falseTaskRate', 'needsReviewShare', 'falseResurrect', 'falseClose'] as const;
   const metricDeltas: EvalCompare['metricDeltas'] = {};
   for (const k of keys) {
     const b = base.metrics[k] ?? null;

@@ -48,12 +48,13 @@ export class OpenRouterProvider implements AIProvider {
     this.siteUrl = opts.siteUrl ?? env.openrouterSiteUrl;
   }
 
-  async analyzeConversation(input: ConversationInput): Promise<AnalyzeOutput> {
+  async analyzeConversation(input: ConversationInput, opts?: { signal?: AbortSignal }): Promise<AnalyzeOutput> {
     if (!this.apiKey) {
       throw new Error(
         'OPENROUTER_API_KEY is not set. Get a key at https://openrouter.ai/keys and put it into .env',
       );
     }
+    opts?.signal?.throwIfAborted();
     const { system, user } = buildPrompt(input, env.timezone);
     const headers: Record<string, string> = {
       Authorization: `Bearer ${this.apiKey}`,
@@ -67,7 +68,9 @@ export class OpenRouterProvider implements AIProvider {
       res = await fetch(`${this.baseUrl}/chat/completions`, {
         method: 'POST',
         headers,
-        signal: AbortSignal.timeout(this.timeoutMs),
+        signal: opts?.signal
+          ? AbortSignal.any([AbortSignal.timeout(this.timeoutMs), opts.signal])
+          : AbortSignal.timeout(this.timeoutMs),
         body: JSON.stringify({
           model: this.model,
           temperature: this.temperature,

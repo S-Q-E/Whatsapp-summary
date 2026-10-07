@@ -1,6 +1,7 @@
 import { sql } from 'drizzle-orm';
 import type { Logger } from 'pino';
 import type { Db } from '../database/db.js';
+import { env } from '../config/env.js';
 import { runBackup } from '../ops/backup.js';
 import { runRetention } from '../ops/retention.js';
 import { analyzeChat, loadPendingBundles, recordChatFailure, resetChatState } from './taskService.js';
@@ -29,8 +30,10 @@ export type SchedulerOptions = {
   intervalMs: number;
   /** максимум чатов за один проход */
   maxChats: number;
-  /** таймаут одного чата, мс (опоздавший анализ всё равно коммитит — идемпотентно) */
+  /** таймаут одного чата, мс: по истечении анализ прерывается через AbortController */
   chatTimeoutMs: number;
+  /** максимум волн анализа на чат за тик (default MAX_WAVES_PER_TICK) */
+  maxWavesPerTick?: number;
   now?: () => number;
   /** обслуживание БД (шаг 9); опущено = только анализ */
   maintenance?: {
@@ -56,6 +59,14 @@ export type TickResult = {
  * параллельный tick пропускается. Ошибка одного чата (включая
  * таймаут и ошибку провайдера) не валит проход; сообщения остаются
  * необработанными и попадут в следующий.
+ * Один чат одновременно разбирает только один анализ: метка inFlight
+ * снимается лишь когда analyzeChat завершился (settled), а не по таймауту.
+ * Таймаут прерывает работу через AbortController (провайдер получает
+ * signal, analyzeChat проверяет его между волнами) — зависшего фона,
+ * который коммитит параллельно со следующим тиком, больше нет.
+ * Частичный прогресс (волны прошли, но бэклог остался — hasMore) —
+ * это успех: fail_count не растёт, бэкофф не включается, чат остаётся
+ * в очереди и добирается следующими тиками по порядку.
  */
 export class AnalyzeScheduler {
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -118,15 +129,20 @@ export class AnalyzeScheduler {
       }
       const provider = this.opts.getProvider();
       const analyzedAt = now();
+      const maxWaves = this.opts.maxWavesPerTick ?? env.maxWavesPerTick;
       for (const b of bundles) {
         if (this.inFlight.has(b.chatId)) continue;
         this.inFlight.add(b.chatId);
         res.chats += 1;
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), this.opts.chatTimeoutMs);
         try {
-          const r = await this.withTimeout(
-            analyzeChat(db, log, provider, b, analyzedAt),
-            this.opts.chatTimeoutMs,
-          );
+          const r = await analyzeChat(db, log, provider, b, analyzedAt, {
+            maxWaves,
+            signal: controller.signal,
+          });
+          // Успех — даже частичный (hasMore): сбрасываем бэкофф,
+          // чат остаётся в очереди и добирается следующими тиками.
           resetChatState(db, b.chatId, now());
           res.created += r.created.length;
           res.updated += r.updated.length;
@@ -141,6 +157,9 @@ export class AnalyzeScheduler {
             'scheduled chat analysis failed, backing off',
           );
         } finally {
+          clearTimeout(timer);
+          // Только после settle самого analyzeChat — зависшего фона нет:
+          // таймаут уже прервал его через signal, мы дождались завершения.
           this.inFlight.delete(b.chatId);
         }
       }
@@ -177,16 +196,6 @@ export class AnalyzeScheduler {
     } catch (err) {
       log.warn({ err }, 'maintenance: backup failed');
     }
-  }
-
-  private withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`chat analysis timed out after ${ms}ms`)), ms);
-    });
-    return Promise.race([p, timeout]).finally(() => {
-      if (timer) clearTimeout(timer);
-    });
   }
 }
 

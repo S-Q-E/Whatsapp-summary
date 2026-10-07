@@ -31,6 +31,10 @@ export type ReconcileResult = {
   created: TaskRow[];
   updated: TaskRow[];
   skipped: number;
+  /** сколько волн анализа выполнено (ставит analyzeChat; у reconcileTasks нет) */
+  waves?: number;
+  /** остались ли необработанные после лимита волн (ставит analyzeChat) */
+  hasMore?: boolean;
 };
 
 type MessageRowLite = {
@@ -375,9 +379,14 @@ function getTaskById(db: Db, id: number): TaskRow | null {
 
 /**
  * Сверка результата AI с БД — идентификация ТОЛЬКО по id.
- * - create: всегда новая строка. Антидубль — только по source_message_id
- *   (UNIQUE-индекс + ON CONFLICT DO NOTHING): повторный прогон того же
- *   сообщения ничего не создаёт. Закрытые задачи НЕ блокируют новые.
+ * - create: новая строка, кроме двух случаев без вставки:
+ *   а) точный повтор (тот же источник + тот же хеш названия) — молча skipped
+ *      (идемпотентный ретрай, UNIQUE-индекс);
+ *   б) источник уже разбирался раньше (у него есть задачи — например,
+ *      сообщение правили и processed_at сброшен), а формулировка новая:
+ *      новая строка НЕ создаётся, открытые задачи этого источника переводятся
+ *      в needs_review (человек проверит). Сопоставления по тексту нет —
+ *      только source_message_id. Закрытые задачи не трогаем (не воскрешаем).
  * - complete/cancel: переход задачи с tasks.id = taskId (строго в этом чате).
  *   Неизвестный id, чужой чат или уже закрытая задача → пропуск с warn.
  * Названия для идентификации не используются никогда.
@@ -392,6 +401,15 @@ export function reconcileTasks(
 ): ReconcileResult {
   const res: ReconcileResult = { chatJid: bundle.chatJid, created: [], updated: [], skipped: 0 };
   const model = `${provider.name}:${provider.model}`;
+  // Источники, разобранные ДО этого вызова (снимок — чтобы два обещания
+  // из одного нового сообщения по-прежнему создавали две задачи).
+  const knownSources = new Set(
+    db
+      .all<{ source_message_id: number }>(
+        sql`SELECT source_message_id FROM tasks WHERE chat_id = ${bundle.chatId} AND source_message_id IS NOT NULL`,
+      )
+      .map((r) => r.source_message_id),
+  );
 
   for (const t of extracted) {
     if (t.action === 'complete' || t.action === 'cancel') {
@@ -440,13 +458,41 @@ export function reconcileTasks(
       continue;
     }
 
-    // create — всегда новая строка; антидубль только по (источник, хеш названия).
+    // create — новая строка, кроме повтора уже разобранного источника (см. шапку).
     // Хеш — НЕ идентификация: повтор того же сообщения с тем же текстом молча
-    // пропускается, а то же обещание новым сообщением или второе обещание
-    // из того же сообщения — создаются.
+    // пропускается; то же обещание новым сообщением или второе обещание
+    // из того же НОВОГО сообщения — создаются.
     const sourceId = checkMessage(db, bundle.chatJid, t.messageId);
     const dueMs = toDueMs(t.dueAt, log, t.title);
     const hash = titleHash(t.title);
+    if (sourceId !== null && knownSources.has(sourceId)) {
+      const same = db.get<{ id: number }>(
+        sql`SELECT id FROM tasks WHERE source_message_id = ${sourceId} AND title_hash = ${hash}`,
+      );
+      if (same) {
+        // Точный повтор (ретрай без правок) — молча пропускаем.
+        res.skipped += 1;
+        continue;
+      }
+      // Источник уже разбирался, формулировка новая (правка/ретрай):
+      // дубль не создаём, открытые задачи источника — на проверку человеку.
+      const openIds = db
+        .all<{ id: number }>(
+          sql`SELECT id FROM tasks WHERE source_message_id = ${sourceId} AND chat_id = ${bundle.chatId} AND status = 'open'`,
+        )
+        .map((r) => r.id);
+      for (const id of openIds) {
+        db.run(sql`UPDATE tasks SET status = 'needs_review', updated_at = ${now} WHERE id = ${id}`);
+        const row = getTaskById(db, id);
+        if (row) res.updated.push(row);
+      }
+      log.warn(
+        { chat: bundle.chatJid, source: sourceId, reviewed: openIds.length },
+        'source already analyzed, create redirected to needs_review (no new task, never match by title)',
+      );
+      res.skipped += 1;
+      continue;
+    }
     const insert = db.run(sql`
       INSERT INTO tasks
         (chat_id, chat_jid, contact_id, title, description, source_message_id, title_hash,
@@ -469,16 +515,23 @@ export function reconcileTasks(
 }
 
 /**
- * Одно окно анализа: самые старые необработанные сообщения чата (до limit).
- * Возвращает ConversationMessage с проставленными existingTaskId.
+ * Одно окно анализа: до priorLimit последних уже разобранных сообщений
+ * ПЕРЕД первым необработанным (контекст, isContext=true) + до limit самых
+ * старых необработанных (новые, isContext=false).
+ * Фильтры те же, что в loadPendingBundles: без удалённых, reaction/protocol,
+ * дайджестов и молодых голосовых без транскрипта (voiceGrace).
+ * Контекст — только в пределах cutoff (AI_CONTEXT_DAYS).
  */
 function loadChatWindow(
   db: Db,
   chatJid: string,
   limit: number,
+  priorLimit: number,
   cutoff: number,
-): ConversationMessage[] {
-  const rows = db.all<MessageRowLite>(sql`
+  nowMs: number,
+): { window: ConversationMessage[]; newIds: number[] } {
+  const graceCutoff = nowMs - env.voiceGraceMin * 60_000;
+  const fresh = db.all<MessageRowLite>(sql`
     SELECT id, chat_jid, sender_name, direction, message_type, text, transcript, duration_sec, timestamp,
            whatsapp_message_id, is_from_me, processed_at
     FROM messages
@@ -486,16 +539,34 @@ function loadChatWindow(
       AND deleted_at IS NULL
       AND message_type NOT IN ('reaction', 'protocol')
       AND NOT (is_from_me = 1 AND text LIKE ${'%' + DIGEST_MARKER + '%'})
-    ORDER BY timestamp ASC LIMIT ${limit}
+      AND NOT (message_type = 'voice' AND transcript IS NULL AND timestamp > ${graceCutoff})
+    ORDER BY timestamp ASC, id ASC LIMIT ${limit}
   `);
-  if (rows.length === 0) return [];
+  if (fresh.length === 0) return { window: [], newIds: [] };
+  const first = fresh[0]!;
+  let prior: MessageRowLite[] = [];
+  if (priorLimit > 0) {
+    prior = db.all<MessageRowLite>(sql`
+      SELECT id, chat_jid, sender_name, direction, message_type, text, transcript, duration_sec, timestamp,
+             whatsapp_message_id, is_from_me, processed_at
+      FROM messages
+      WHERE chat_jid = ${chatJid} AND processed_at IS NOT NULL AND timestamp >= ${cutoff}
+        AND (timestamp < ${first.timestamp} OR (timestamp = ${first.timestamp} AND id < ${first.id}))
+        AND deleted_at IS NULL
+        AND message_type NOT IN ('reaction', 'protocol')
+        AND NOT (is_from_me = 1 AND text LIKE ${'%' + DIGEST_MARKER + '%'})
+        AND NOT (message_type = 'voice' AND transcript IS NULL AND timestamp > ${graceCutoff})
+      ORDER BY timestamp DESC, id DESC LIMIT ${priorLimit}
+    `);
+    prior.reverse(); // старые -> новые
+  }
   const taskByMsg = new Map<number, number>();
   for (const r of db.all<{ source_message_id: number; id: number }>(
     sql`SELECT source_message_id, id FROM tasks WHERE chat_jid = ${chatJid} AND source_message_id IS NOT NULL`,
   )) {
     if (!taskByMsg.has(r.source_message_id)) taskByMsg.set(r.source_message_id, r.id);
   }
-  return rows.map((m) => ({
+  const toMsg = (m: MessageRowLite, isContext: boolean): ConversationMessage => ({
     id: m.id,
     direction: (m.is_from_me ? 'outgoing' : 'incoming') as 'incoming' | 'outgoing',
     senderName: m.sender_name,
@@ -506,31 +577,54 @@ function loadChatWindow(
     timestamp: m.timestamp,
     whatsappMessageId: m.whatsapp_message_id,
     existingTaskId: taskByMsg.get(m.id) ?? null,
-  }));
+    isContext,
+  });
+  return {
+    window: [...prior.map((m) => toMsg(m, true)), ...fresh.map((m) => toMsg(m, false))],
+    newIds: fresh.map((m) => m.id),
+  };
 }
 
 /**
- * Полный цикл для одного чата: контекст окнами по порядку (старые -> новые)
- * до исчерпания необработанных. После УСПЕШНОГО окна помечаются все
- * необработанные с timestamp <= максимума окна. При ошибке провайдера
- * (включая провал retry) пробрасываем исключение — сообщения остаются
- * необработанными и попадут в следующий прогон.
+ * Полный цикл для одного чата: окна по порядку (старые -> новые),
+ * но не больше maxWaves волн за вызов (бэклог разбирается за несколько
+ * тиков; прогресс — не ошибка). Каждое окно = prior-контекст
+ * (уже разобранные, isContext=true) + новые (isContext=false).
+ * После УСПЕШНОГО окна помечаются ТОЛЬКО новые сообщения окна (по id);
+ * контекстные не трогаются, молодые голосовые без транскрипта (voiceGrace)
+ * в окно не попадают и не помечаются. Следующая волна берёт контекстом
+ * хвост предыдущей (уже помечена обработанной). При ошибке провайдера
+ * (включая провал retry) или отмене по signal пробрасываем исключение —
+ * сообщения остаются необработанными и попадут в следующий прогон.
+ * signal проверяется между волнами; провайдер получает его же и обязан
+ * быстро завершиться.
  */
+export type AnalyzeChatOptions = {
+  /** волн за вызов (default MAX_WAVES_PER_TICK) */
+  maxWaves?: number;
+  /** отмена по таймауту чата в планировщике */
+  signal?: AbortSignal;
+};
+
 export async function analyzeChat(
   db: Db,
   log: Logger,
   provider: AIProvider,
   bundle: ChatBundle,
   analyzedAt: number,
+  opts: AnalyzeChatOptions = {},
 ): Promise<ReconcileResult> {
   const limit = env.aiContextLimit;
+  const priorLimit = env.aiContextPrior;
+  const maxWaves = Math.max(1, Math.floor(opts.maxWaves ?? env.maxWavesPerTick));
   const cutoff = analyzedAt - env.aiContextDays * 86_400_000;
   const sinceClosed = analyzedAt - env.aiContextDays * 86_400_000;
-  const res: ReconcileResult = { chatJid: bundle.chatJid, created: [], updated: [], skipped: 0 };
+  const res: ReconcileResult = { chatJid: bundle.chatJid, created: [], updated: [], skipped: 0, waves: 0, hasMore: false };
   // Защита от зацикливания при гонках пометок.
-  for (let wave = 0; wave < 100; wave++) {
-    const window = loadChatWindow(db, bundle.chatJid, limit, cutoff);
-    if (window.length === 0) break;
+  for (let wave = 0; wave < maxWaves; wave++) {
+    opts.signal?.throwIfAborted();
+    const { window, newIds } = loadChatWindow(db, bundle.chatJid, limit, priorLimit, cutoff, analyzedAt);
+    if (window.length === 0 || newIds.length === 0) break;
     const ctx = buildPromptContext(
       { ...bundle, messages: window },
       loadOpenTasks(db, bundle.chatId),
@@ -541,11 +635,11 @@ export async function analyzeChat(
     const input: ConversationInput = ctx.input;
     let output;
     try {
-      output = await provider.analyzeConversation(input);
+      output = await provider.analyzeConversation(input, opts.signal ? { signal: opts.signal } : undefined);
     } catch (err) {
       if (err instanceof AIValidationError) {
         log.warn({ chat: bundle.chatJid }, 'model output invalid, single retry');
-        output = await provider.analyzeConversation(input);
+        output = await provider.analyzeConversation(input, opts.signal ? { signal: opts.signal } : undefined);
       } else {
         throw err;
       }
@@ -558,12 +652,34 @@ export async function analyzeChat(
     res.created.push(...r.created);
     res.updated.push(...r.updated);
     res.skipped += r.skipped;
-    const maxTs = Math.max(...window.map((m) => m.timestamp));
+    res.waves = (res.waves ?? 0) + 1;
+    // Помечаем только новые сообщения этого окна — контекстные не трогаем,
+    // grace-голосовые сюда не входят и остаются необработанными.
     const marked = db.run(sql`
       UPDATE messages SET processed_at = ${Date.now()}
-      WHERE chat_jid = ${bundle.chatJid} AND processed_at IS NULL AND timestamp <= ${maxTs}
+      WHERE chat_jid = ${bundle.chatJid} AND processed_at IS NULL
+        AND id IN (${sql.join(newIds.map((id) => sql`${id}`), sql`, `)})
     `);
     if (Number(marked.changes ?? 0) === 0) break;
   }
+  // Лимит волн исчерпан, а разбирать ещё есть — это прогресс, не ошибка:
+  // вызывающий (планировщик) не растит fail_count и не включает бэкофф.
+  if ((res.waves ?? 0) >= maxWaves) {
+    res.hasMore = hasFreshUnprocessed(db, bundle.chatJid, cutoff, analyzedAt);
+  }
   return res;
+}
+
+/** Остались ли разбираемые необработанные (те же фильтры, что у окна). */
+function hasFreshUnprocessed(db: Db, chatJid: string, cutoff: number, nowMs: number): boolean {
+  const graceCutoff = nowMs - env.voiceGraceMin * 60_000;
+  const row = db.get<{ n: number }>(sql`
+    SELECT COUNT(*) AS n FROM messages
+    WHERE chat_jid = ${chatJid} AND processed_at IS NULL AND timestamp >= ${cutoff}
+      AND deleted_at IS NULL
+      AND message_type NOT IN ('reaction', 'protocol')
+      AND NOT (is_from_me = 1 AND text LIKE ${'%' + DIGEST_MARKER + '%'})
+      AND NOT (message_type = 'voice' AND transcript IS NULL AND timestamp > ${graceCutoff})
+  `);
+  return (row?.n ?? 0) > 0;
 }

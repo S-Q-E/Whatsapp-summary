@@ -48,16 +48,17 @@ export class AutoProvider implements AIProvider {
     this.promptVersion = primary.promptVersion;
   }
 
-  async analyzeConversation(input: ConversationInput): Promise<AnalyzeOutput> {
+  async analyzeConversation(input: ConversationInput, opts?: { signal?: AbortSignal }): Promise<AnalyzeOutput> {
     try {
-      return await this.primary.analyzeConversation(input);
+      return await this.primary.analyzeConversation(input, opts);
     } catch (err) {
       if (!this.allowFallback) throw err;
+      opts?.signal?.throwIfAborted();
       logger.warn(
         { err: (err as Error).message },
         'primary AI provider failed, heuristic fallback (all created tasks marked needs_review)',
       );
-      const out = await this.fallback.analyzeConversation(input);
+      const out = await this.fallback.analyzeConversation(input, opts);
       return {
         tasks: out.tasks.map((t) =>
           t.action === 'create' ? { ...t, status: 'needs_review' as const } : t,

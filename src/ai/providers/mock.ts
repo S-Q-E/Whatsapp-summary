@@ -14,8 +14,9 @@ export class MockProvider implements AIProvider {
 
   constructor(private readonly byChat: Record<string, AnalyzeOutput> = {}) {}
 
-  async analyzeConversation(input: ConversationInput): Promise<AnalyzeOutput> {
+  async analyzeConversation(input: ConversationInput, opts?: { signal?: AbortSignal }): Promise<AnalyzeOutput> {
     this.calls.push(input);
+    opts?.signal?.throwIfAborted();
     const out = this.byChat[input.chatJid] ?? { tasks: [] };
     // глубокая копия, чтобы сервис не мутировал фикстуры
     return JSON.parse(JSON.stringify(out)) as AnalyzeOutput;

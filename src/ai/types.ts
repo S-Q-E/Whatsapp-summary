@@ -20,6 +20,12 @@ export type ConversationMessage = {
   whatsappMessageId: string;
   /** id задачи, уже созданной из этого сообщения (пометка в контексте) */
   existingTaskId?: number | null;
+  /**
+   * true = уже разобранное сообщение, показано модели только для понимания
+   * смысла (контекст); false = новое, из него создаются задачи.
+   * Опционально, чтобы старые фикстуры/провайдеры без флага не ломались.
+   */
+  isContext?: boolean;
 };
 
 /** Уже известные открытые задачи чата — AI закрывает их по id. */
@@ -103,6 +109,8 @@ export type AnalyzeOutput = {
  * Абстракция AI-провайдера. Бизнес-логика (taskService) зависит только
  * от этого интерфейса — конкретную модель можно менять через .env
  * без touching кода сервиса: Ollama, OpenRouter, Gemini, Claude...
+ * opts.signal — отмена по таймауту чата: провайдер обязан быстро
+ * завершиться (fetch рвётся сам, долгие ожидания слушают abort).
  */
 export interface AIProvider {
   /** человекочитаемое имя провайдера, пишется в tasks.model */
@@ -111,5 +119,5 @@ export interface AIProvider {
   readonly model: string;
   /** версия промпта, пишется в tasks.prompt_version */
   readonly promptVersion: string;
-  analyzeConversation(input: ConversationInput): Promise<AnalyzeOutput>;
+  analyzeConversation(input: ConversationInput, opts?: { signal?: AbortSignal }): Promise<AnalyzeOutput>;
 }

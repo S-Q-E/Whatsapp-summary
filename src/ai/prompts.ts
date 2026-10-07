@@ -7,8 +7,11 @@ import type { ConversationInput } from './types.js';
  * - v1: контракт create|update + matchTitle (сопоставление по названию);
  * - v2: контракт create|complete|cancel + taskId числом, источник — wamid;
  * - v3: ссылки ключами промпта (t<id>/m<id>), время в TIMEZONE со смещением.
+ * - v4: окно = prior-контекст (isContext, пометка «[контекст, уже разобрано]»)
+ *   + новые; задачи create — только из новых, контекст — для смысла и как
+ *   evidence для complete/cancel.
  */
-export const PROMPT_VERSION = 'task-extract-v3';
+export const PROMPT_VERSION = 'task-extract-v4';
 
 const SYSTEM_PROMPT = `Ты — секретарь врача. Анализируешь КОНТЕКСТ переписки врача с пациентом или коллегой и извлекаешь ОБЯЗАТЕЛЬСТВА ВРАЧА — конкретные дела, которые врач пообещал сделать.
 
@@ -24,7 +27,8 @@ const SYSTEM_PROMPT = `Ты — секретарь врача. Анализир�
 5. Если уверенность низкая (намёк без явного обещания) — всё равно верни задачу action "create", но со status "needs_review" и честной низкой confidence.
 6. Срок (dueAt): только если назван явно ("сегодня вечером", "завтра утром", конкретная дата). Считай от текущего локального времени, указанного во входных данных (время уже с часовым поясом). Формат dueAt — ISO 8601 со смещением. В dueText сохрани исходную фразу. Если срока нет — оба поля null.
 7. evidenceMessageId — ключ [m..] того сообщения, где врач пообещал (create) или отчитался/отменил (complete/cancel). Только реально существующий ключ из переписки ниже.
-8. Отвечай СТРОГО одним JSON-объектом без пояснений, markdown и комментариев:
+8. Сообщения с пометкой «[контекст, уже разобрано]» — это уже разобранный контекст: задачи create создавай ТОЛЬКО из новых сообщений (без пометки). Контекстные используй для понимания смысла реплик («Да, вечером посмотрю» — о чём речь) и как evidenceMessageId для complete/cancel.
+9. Отвечай СТРОГО одним JSON-объектом без пояснений, markdown и комментариев:
 {"actions": [{"type": "create", "taskId": null, "title": string, "description": string|null, "status": "open|needs_review", "dueAt": string|null, "dueText": string|null, "evidenceMessageId": "m34"|null, "confidence": 0..1}, {"type": "complete|cancel", "taskId": "t12", "title": string, "description": string|null, "evidenceMessageId": "m34"|null, "confidence": 0..1}]}
 Пустой результат: {"actions": []}. (status только для create; по умолчанию "open").`;
 
@@ -39,7 +43,8 @@ function formatMessage(
   const time = formatLocal(m.timestamp, timezone);
   const body = messageBody(m);
   const hasTask = m.existingTaskId ? ` [уже есть задача #${m.existingTaskId}]` : '';
-  return `[${msgKey(m.id)}] [${time}] ${who}: ${body}${hasTask}`;
+  const ctxMark = m.isContext ? ' [контекст, уже разобрано]' : '';
+  return `[${msgKey(m.id)}] [${time}] ${who}: ${body}${hasTask}${ctxMark}`;
 }
 
 /** Текст или честный плейсхолдер типа (шаг 4.5: голосовые — с длительностью). */

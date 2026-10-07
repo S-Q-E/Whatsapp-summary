@@ -82,7 +82,8 @@ async function main(): Promise<void> {
   console.log(
     `\nprecision=${fmt(metrics.createPrecision)} recall=${fmt(metrics.createRecall)} ` +
       `closeAcc=${fmt(metrics.closeAccuracy)} cancelAcc=${fmt(metrics.cancelAccuracy)} ` +
-      `ложные=${fmt(metrics.falseTaskRate)} needs_review=${fmt(metrics.needsReviewShare)}`,
+      `ложные=${fmt(metrics.falseTaskRate)} needs_review=${fmt(metrics.needsReviewShare)} ` +
+      `воскрешения=${metrics.falseResurrect} ложныеЗакрытия=${metrics.falseClose}`,
   );
 
   const safeModel = modelName.replace(/[^a-zA-Z0-9_.-]+/g, '_');
